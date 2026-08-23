@@ -83,6 +83,7 @@ class GattServerManager(
             }
             gattServer = server
             server.addService(Insta360Uuids.buildService())
+            server.addService(Insta360Uuids.buildSecondaryService())
             startAdvertising()
             ServiceStatus.setBleState(BleConnectionState.Advertising)
             true
@@ -122,6 +123,17 @@ class GattServerManager(
         }
         advertiser = adv
 
+        // Geraetename wie das Original-Remote setzen - die Kamera findet uns
+        // (zumindest teilweise) ueber den Namen "Insta360 GPS Remote".
+        try {
+            if (adapter.name != Insta360Uuids.REMOTE_DEVICE_NAME) {
+                adapter.name = Insta360Uuids.REMOTE_DEVICE_NAME
+                Diagnostics.log(TAG, "Bluetooth-Name gesetzt: ${Insta360Uuids.REMOTE_DEVICE_NAME}")
+            }
+        } catch (e: Exception) {
+            Diagnostics.log(TAG, "Konnte Bluetooth-Namen nicht setzen: ${e.message}")
+        }
+
         // ADVERTISE_MODE_BALANCED als Kompromiss: schnellere Connectbarkeit als
         // LOW_POWER, deutlich weniger Strom als LOW_LATENCY-Dauerbetrieb.
         val settings = AdvertiseSettings.Builder()
@@ -131,11 +143,14 @@ class GattServerManager(
             .setTimeout(0)
             .build()
 
-        // 128-bit-UUID braucht 18 Bytes im Adv-Payload -> Device-Name in den Scan-Response.
+        // Wie die ESP32-Referenz: BEIDE Service-UUIDs im Adv-Payload
+        // (16-bit ce80 + 128-bit Sekundaerservice = 25 Bytes, passt in 31),
+        // der Geraetename liegt im Scan-Response.
         val advertiseData = AdvertiseData.Builder()
             .setIncludeDeviceName(false)
-            .setIncludeTxPowerLevel(true)
+            .setIncludeTxPowerLevel(false)
             .addServiceUuid(Insta360Uuids.SERVICE_PARCEL_UUID)
+            .addServiceUuid(Insta360Uuids.SECONDARY_SERVICE_PARCEL_UUID)
             .build()
 
         val scanResponse = AdvertiseData.Builder()
