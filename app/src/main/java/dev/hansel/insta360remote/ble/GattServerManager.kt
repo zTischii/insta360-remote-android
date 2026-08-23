@@ -175,18 +175,20 @@ class GattServerManager(
             .setTimeout(0)
             .build()
 
-        // Adv-Paket wie das Original-Remote: Name + 16-bit UUID 0xBE80 (das ist
-        // das UUID-Set, nach dem die Kamera filtert - per Pairing-Sniff des X4
-        // verifiziert). Der 128-bit Sekundaerservice liegt im Scan-Response.
+        // EXAKT wie die ESP32-Referenz (Chwalek-Medium-Artikel): BEIDE
+        // Service-UUIDs im Adv-Paket (16-bit ce80 + 128-bit Sekundaerservice,
+        // inkl. TX-Power), der Geraetename "Insta360 GPS Remote" im Scan-
+        // Response. Genau dieses Layout fuehrte bereits zu "Remote verbunden"
+        // auf der Kamera.
         val advertiseData = AdvertiseData.Builder()
-            .setIncludeDeviceName(true)
-            .setIncludeTxPowerLevel(false)
-            .addServiceUuid(Insta360Uuids.ADVERTISED_SERVICE_PARCEL_UUID)
+            .setIncludeDeviceName(false)
+            .setIncludeTxPowerLevel(true)
+            .addServiceUuid(Insta360Uuids.SERVICE_PARCEL_UUID)
+            .addServiceUuid(Insta360Uuids.SECONDARY_SERVICE_PARCEL_UUID)
             .build()
 
         val scanResponse = AdvertiseData.Builder()
-            .setIncludeDeviceName(false)
-            .addServiceUuid(Insta360Uuids.SECONDARY_SERVICE_PARCEL_UUID)
+            .setIncludeDeviceName(true)
             .build()
 
         adv.startAdvertising(settings, advertiseData, scanResponse, advertiseCallback)

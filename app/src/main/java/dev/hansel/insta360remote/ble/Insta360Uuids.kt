@@ -98,6 +98,9 @@ object Insta360Uuids {
             CCCD_UUID,
             BluetoothGattDescriptor.PERMISSION_WRITE or BluetoothGattDescriptor.PERMISSION_READ
         )
+        // Wie ESP32 BLE2902 mit setNotifications(true)+setIndications(true):
+        // initialer CCCD-Wert 0x0003.
+        cccd.value = byteArrayOf(0x03, 0x00)
         notifyChar.addDescriptor(cccd)
 
         val extraChar = readChar(CHAR_EXTRA_UUID, byteArrayOf(0x01, 0x02)) // uint16 0x0201 LE

@@ -94,8 +94,10 @@ object CameraScanner {
                 Diagnostics.log(TAG, ">>> KAMERA GEFUNDEN: name=$name addr=${result.device.address} rssi=${result.rssi}")
                 Diagnostics.log(TAG, "    uuids=$uuids")
                 Diagnostics.log(TAG, "    advBytes=${Diagnostics.hex(result.scanRecord?.bytes)}")
-                // Experiment: Rolle-Tausch-These - wir connecten als Central zur Kamera
-                CameraClient.connect(context, result.device)
+                // HINWEIS: Central-Rollen-Versuch deaktiviert - das X4 erwartet
+                // laut Chwalek-Referenz das Modell "Kamera verbindet sich aufs
+                // Peripheral". CameraClient bleibt fuer Experimente erhalten.
+                // CameraClient.connect(context, result.device)
             }
         }
     }
