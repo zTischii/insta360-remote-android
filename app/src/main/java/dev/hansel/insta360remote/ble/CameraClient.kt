@@ -1,4 +1,4 @@
-package dev.hansel.insta360remote.ble
+﻿package dev.hansel.insta360remote.ble
 
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothDevice
@@ -10,11 +10,9 @@ import android.content.Context
 import dev.hansel.insta360remote.core.Diagnostics
 
 /**
- * Experimenteller Central-Rollen-Client: Das X4 advertised im Pairing-Modus
- * selbst die 16-bit-UUID 0xBE80. Moegliches Protokoll-Design: Das REMOTE ist
- * beim Pairing der Central und verbindet sich zur Kamera. Diese Klasse baut
- * diese Verbindung auf und protokolliert die komplette GATT-Datenbank der
- * Kamera - damit sehen wir exakt, welche Dienste die Kamera anbietet.
+ * Architektur B (xaionaro-go/insta360ctl): Wir sind BLE-Central und verbinden
+ * uns zum BE80-GATT-Server der Kamera. GPS-Injection per Cmd 0x35 UploadGPS
+ * mit Header16-Format und lat/lon/alt als float64 LE.
  */
 object CameraClient {
 
@@ -22,35 +20,38 @@ object CameraClient {
 
     private var gatt: BluetoothGatt? = null
     private var connectingAddress: String? = null
+    private var writeCharacteristic: BluetoothGattCharacteristic? = null
+    private var seq = 0
+
+    private val handler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var keepaliveRunning = false
+    private var gpsStreamRunning = false
+
+    @Volatile
+    var pendingFix: dev.hansel.insta360remote.location.GpsFix? = null
+
+    val isConnected: Boolean get() = gatt != null
 
     @SuppressLint("MissingPermission")
     fun connect(context: Context, device: BluetoothDevice) {
         if (gatt != null || connectingAddress == device.address) return
         connectingAddress = device.address
-        Diagnostics.log(TAG, "VERBINDE als Central zu ${device.address} (${device.name})...")
+        Diagnostics.log(TAG, "VERBINDE als Central zu " + device.address)
         try {
-            gatt = device.connectGatt(
-                context, false, callback, BluetoothDevice.TRANSPORT_LE
-            )
+            gatt = device.connectGatt(context, false, callback, BluetoothDevice.TRANSPORT_LE)
         } catch (e: Exception) {
-            Diagnostics.log(TAG, "connectGatt fehlgeschlagen: ${e.message}")
+            Diagnostics.log(TAG, "connectGatt fehlgeschlagen: " + e.message)
             gatt = null
             connectingAddress = null
         }
     }
 
     fun close() {
+        callback.stopTimers()
         try { gatt?.close() } catch (_: Exception) {}
         gatt = null
         connectingAddress = null
     }
-
-    /** true, wenn ein Central-Link zur Kamera be80-Server besteht. */
-    val isConnected: Boolean get() = gatt != null
-
-    /** Sendet einen Fix per UploadGPS (Cmd 0x35) an den Kamera-Server. */
-    fun sendGpsFix(fix: dev.hansel.insta360remote.location.GpsFix): Boolean =
-        callback.sendGpsFix(fix)
 
     private val callback = object : BluetoothGattCallback() {
 
@@ -59,15 +60,11 @@ object CameraClient {
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
                     Diagnostics.log(TAG, "Mit Kamera verbunden - requestMtu(517)")
-                    // Wie ESP32-Referenz: MTU-Anforderung vor der Discovery.
-                    if (!g.requestMtu(517)) {
-                        Diagnostics.log(TAG, "requestMtu abgelehnt - mache direkt Discovery")
-                        g.discoverServices()
-                    }
+                    if (!g.requestMtu(517)) g.discoverServices()
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
-                    Diagnostics.log(TAG, "Kamera-Verbindung getrennt (status=$status)")
-                    stopKeepalive()
+                    Diagnostics.log(TAG, "Kamera-Verbindung getrennt (status=" + status + ")")
+                    stopTimers()
                     try { g.close() } catch (_: Exception) {}
                     gatt = null
                     connectingAddress = null
@@ -76,47 +73,38 @@ object CameraClient {
         }
 
         override fun onMtuChanged(g: BluetoothGatt, mtu: Int, status: Int) {
-            Diagnostics.log(TAG, "MTU ausgehandelt: $mtu (status=$status)")
+            Diagnostics.log(TAG, "MTU: " + mtu)
             g.discoverServices()
         }
 
         @SuppressLint("MissingPermission")
         override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
-            Diagnostics.log(TAG, "=== GATT-DATENBANK DER KAMERA (status=$status) ===")
-            for (service in g.services) {
-                Diagnostics.log(TAG, "SERVICE ${service.uuid}")
-                for (c in service.characteristics) {
-                    Diagnostics.log(
-                        TAG,
-                        "  CHAR ${c.uuid} [prop=${c.properties}] init=${Diagnostics.hex(c.value)}"
-                    )
-                }
-            }
-            Diagnostics.log(TAG, "=== ENDE GATT-DATENBANK ===")
+            val be80 = java.util.UUID.fromString("0000be80-0000-1000-8000-00805f9b34fb")
+            val be81 = java.util.UUID.fromString("0000be81-0000-1000-8000-00805f9b34fb")
+            val be82 = java.util.UUID.fromString("0000be82-0000-1000-8000-00805f9b34fb")
+            val cccd = java.util.UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
-            // Schritt 1: Nur das CCCD von be82 aktivieren. GATT-Operationen sind
-            val be80Service = g.getService(java.util.UUID.fromString("0000be80-0000-1000-8000-00805f9b34fb"))
-            val be82 = be80Service?.getCharacteristic(
-                java.util.UUID.fromString("0000be82-0000-1000-8000-00805f9b34fb")
-            )
-            if (be82 == null) {
-                Diagnostics.log(TAG, "WARNUNG: be82 auf der Kamera nicht gefunden!")
+            writeCharacteristic = g.getService(be80)?.getCharacteristic(be81)
+            val notifyChar = g.getService(be80)?.getCharacteristic(be82)
+            if (writeCharacteristic == null || notifyChar == null) {
+                Diagnostics.log(TAG, "WARNUNG: be80/be81/be82 auf der Kamera unvollstaendig!")
                 return
             }
-            g.setCharacteristicNotification(be82, true)
-            val cccd = be82.getDescriptor(
-                java.util.UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
-            )
-            if (cccd == null) {
-                Diagnostics.log(TAG, "WARNUNG: CCCD an be82 fehlt!")
+
+            g.setCharacteristicNotification(notifyChar, true)
+            val desc = notifyChar.getDescriptor(cccd)
+            if (desc == null) {
+                Diagnostics.log(TAG, "WARNUNG: CCCD fehlt an be82")
+                startTimers(g)
                 return
             }
-            cccd.value = byteArrayOf(0x01, 0x00) // Notification enable
-            val accepted = try { g.writeDescriptor(cccd) } catch (e: Exception) {
-                Diagnostics.log(TAG, "writeDescriptor exception: ${e.message}")
+            desc.value = byteArrayOf(0x01, 0x00)
+            val ok = try { g.writeDescriptor(desc) } catch (e: Exception) {
+                Diagnostics.log(TAG, "CCCD-Write exception: " + e.message)
                 false
             }
-            Diagnostics.log(TAG, "CCCD-Write fuer be82 akzeptiert: $accepted")
+            Diagnostics.log(TAG, "CCCD-Write akzeptiert: " + ok)
+            if (!ok) startTimers(g)
         }
 
         @SuppressLint("MissingPermission")
@@ -125,139 +113,73 @@ object CameraClient {
             descriptor: android.bluetooth.BluetoothGattDescriptor,
             status: Int,
         ) {
-            Diagnostics.log(
-                TAG,
-                "CCCD geschrieben (${descriptor.characteristic.uuid}) status=$status"
-            )
-            if (status != BluetoothGatt.GATT_SUCCESS) return
+            Diagnostics.log(TAG, "CCCD geschrieben, status=" + status)
+            // Reads + Sync + Timer erst nach Abschluss starten (sequenziell).
+            handler.postDelayed({ startTimers(g) }, 1500)
+        }
 
-            // Schritt 2: Jetzt alle lesbaren Charakteristiken der Kamera lesen.
-            for (service in g.services) {
-                for (c in service.characteristics) {
-                    if (c.properties and BluetoothGattCharacteristic.PROPERTY_READ != 0 &&
-                        c.uuid != java.util.UUID.fromString("00002a05-0000-1000-8000-00805f9b34fb")
-                    ) {
-                        try { g.readCharacteristic(c) } catch (_: Exception) {}
+        private fun startTimers(g: BluetoothGatt) {
+            // Sync-Handshake (Typ 06 + Magic syNceNdinS).
+            val sync = ByteArray(20)
+            sync[0] = 0x14
+            sync[4] = 0x06
+            "syNceNdinS".toByteArray(Charsets.US_ASCII).copyInto(sync, 7)
+            writeToBe81(g, sync, "SYNC")
+
+            // Keepalive (Typ 05) alle 2s.
+            if (!keepaliveRunning) {
+                keepaliveRunning = true
+                Diagnostics.log(TAG, "Keepalive (Typ 05, 2s) aktiv")
+                handler.postDelayed(object : Runnable {
+                    override fun run() {
+                        if (!keepaliveRunning || gatt == null) return
+                        writeToBe81(
+                            g,
+                            byteArrayOf(0x07, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00),
+                            null
+                        )
+                        handler.postDelayed(this, 2000)
                     }
-                }
+                }, 0)
             }
-            Diagnostics.log(TAG, "Alle Read-Versuche abgeschickt - Kamera-Link vollstaendig aufgebaut")
 
-            // Schritt 3: GPS-Stream starten (Cmd 0x35 UploadGPS alle 1s).
-            startGpsStream(g)
-
-            // Schritt 3: Sync-Handshake (Typ 06 + Magic "syNceNdinS", gemaess
-            // GO-Ultra-Protokoll-Doku) und danach 2s-Keepalive starten.
-            writeCharacteristic = g.getService(
-                java.util.UUID.fromString("0000be80-0000-1000-8000-00805f9b34fb")
-            )?.getCharacteristic(
-                java.util.UUID.fromString("0000be81-0000-1000-8000-00805f9b34fb")
-            )
-            if (writeCharacteristic != null) {
-                val syncFrame = ByteArray(20)
-                syncFrame[0] = 0x14 // len = 20
-                syncFrame[4] = 0x06 // Type: Sync
-                "syNceNdinS".toByteArray(Charsets.US_ASCII).copyInto(syncFrame, 7)
-                try {
-                    writeCharacteristic!!.writeType =
-                        BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-                    writeCharacteristic!!.value = syncFrame
-                    val ok = g.writeCharacteristic(writeCharacteristic!!)
-                    Diagnostics.log(
-                        TAG,
-                        "SYNC gesendet (" + Diagnostics.hex(syncFrame) + ") ok=" + ok
-                    )
-                } catch (e: Exception) {
-                    Diagnostics.log(TAG, "Sync-Write fehlgeschlagen: ${e.message}")
-                }
-                startKeepalive(g)
-            } else {
-                Diagnostics.log(TAG, "WARNUNG: be81 (write) nicht gefunden!")
-            }
-        }
-
-        // ------------------------------------------------------------ Kommandos
-
-        private var writeCharacteristic: BluetoothGattCharacteristic? = null
-
-        /** SN-Zaehler, Startwert 5120 (0x1400) gemaess ESP32-Referenz. */
-        private var sn = 5120
-
-        /**
-         * Exakte Replik von create_cmd() aus dem funktionierenden One-X2-Remote:
-         * [total_len][00 00 00][mode][00 00][c1][00][sn_hi][sn_lo][00 00 80 00 00]
-         * [protobuf-payload ab Offset 16]
-         */
-        private fun buildCmd(mode: Int, c1: Int?, payload: ByteArray?): ByteArray {
-            val pb = payload ?: ByteArray(0)
-            val cmd = ByteArray(16 + pb.size)
-            cmd[4] = mode.toByte()
-            var len = 7
-            if (c1 != null && c1 != 0xFF) {
-                cmd[7] = c1.toByte()
-                cmd[8] = 0
-                cmd[9] = ((sn shr 8) and 0xFF).toByte()
-                cmd[10] = (sn and 0xFF).toByte()
-                sn++
-                cmd[11] = 0x00
-                cmd[12] = 0
-                cmd[13] = 0x80.toByte()
-                cmd[14] = 0
-                cmd[15] = 0
-                len += 9
-            }
-            pb.copyInto(cmd, 16)
-            cmd[0] = (len + pb.size).toByte()
-            return cmd.copyOf(len + pb.size)
-        }
-
-        private val keepaliveHandler = android.os.Handler(android.os.Looper.getMainLooper())
-        private var keepaliveRunning = false
-
-        /** BLE-Keepalive-Frame wie er uns vom X4 selbst zugesendet wurde. */
-        private val KEEPALIVE_FRAME = byteArrayOf(
-            0x07, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00
-        )
-
-        @SuppressLint("MissingPermission")
-        private fun startKeepalive(g: BluetoothGatt) {
-            if (keepaliveRunning) return
-            keepaliveRunning = true
-            Diagnostics.log(TAG, "Starte 2s-Keepalive (Typ 05) auf be81")
-            val tick = object : Runnable {
-                override fun run() {
-                    val wc = writeCharacteristic
-                    if (!keepaliveRunning || wc == null) return
-                    try {
-                        wc.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-                        wc.value = KEEPALIVE_FRAME
-                        val ok = g.writeCharacteristic(wc)
-                        if (!ok) Diagnostics.log(TAG, "keepalive write lieferte false")
-                    } catch (e: Exception) {
-                        Diagnostics.log(TAG, "Keepalive-Write fehlgeschlagen: ${e.message}")
+            // GPS-Stream (Cmd 0x35 UploadGPS) alle 1s.
+            if (!gpsStreamRunning) {
+                gpsStreamRunning = true
+                Diagnostics.log(TAG, "GPS-Stream (UploadGPS, 1s) aktiv")
+                handler.postDelayed(object : Runnable {
+                    override fun run() {
+                        val fix = pendingFix ?: run {
+                            handler.postDelayed(this, 1000); return
+                        }
+                        sendGpsFixInternal(g, fix)
+                        handler.postDelayed(this, 1000)
                     }
-                    keepaliveHandler.postDelayed(this, 2000)
-                }
+                }, 500)
             }
-            keepaliveHandler.post(tick)
         }
 
-        /** Status-Poll (Cmd-ID 15 = GetCurrentCaptureStatus), fuer Experimente. */
-        @SuppressLint("MissingPermission")
-        fun sendStatusPoll() {
+        fun stopTimers() {
+            keepaliveRunning = false
+            gpsStreamRunning = false
+            handler.removeCallbacksAndMessages(null)
+        }
+
+        private fun writeToBe81(g: BluetoothGatt, data: ByteArray, label: String?) {
             val wc = writeCharacteristic ?: return
-            val g = gatt ?: return
             try {
                 wc.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-                wc.value = buildCmd(0x04, 0x0F, null)
-                g.writeCharacteristic(wc)
-            } catch (_: Exception) {}
+                wc.value = data
+                val ok = g.writeCharacteristic(wc)
+                if (label != null) {
+                    Diagnostics.log(TAG, label + " gesendet (" + Diagnostics.hex(data) + ") ok=" + ok)
+                }
+            } catch (e: Exception) {
+                Diagnostics.log(TAG, "Write fehlgeschlagen: " + e.message)
+            }
         }
 
-        // -------------------------------------------------- GPS-Injection
-        // Exakt gemaess xaionaro-go/insta360ctl (pkg/direct/gps.go +
-        // pkg/protocol/header.go): Command CodeUploadGPS = 53 (0x35),
-        // Payload = 3 x float64 Little-Endian (lat, lon, alt).
+        // -------------------------------------------------- Header16 + GPS
 
         private var gpsSeq = 0
 
@@ -268,13 +190,9 @@ object CameraClient {
         }
 
         /**
-         * Header16-Nachricht (X3/X4/X5-Architektur B):
-         * [0..1] uint16 LE payload_length (ohne Header)
-         * [4]    0x04 (Mode)
-         * [7]    Command code
-         * [9]    0x02 (Content type protobuf)
-         * [10]   Sequence number (1-254)
-         * [13]   0x80 (is_last_fragment)
+         * Header16 (X3/X4/X5 Architektur B):
+         * [0..1] uint16 LE payload_len | [4] 0x04 | [7] cmd | [9] 0x02 |
+         * [10] seq (1-254) | [13] 0x80 | payload ab Offset 16.
          */
         private fun buildHeader16Message(cmd: Int, payload: ByteArray): ByteArray {
             val msg = ByteArray(16 + payload.size)
@@ -291,69 +209,38 @@ object CameraClient {
 
         private fun putDoubleLE(dst: ByteArray, offset: Int, value: Double) {
             val bits = java.lang.Double.doubleToRawLongBits(value)
-            for (i in 0 until 8) {
-                dst[offset + i] = ((bits ushr (8 * i)) and 0xFF).toByte()
-            }
+            for (i in 0 until 8) dst[offset + i] = ((bits ushr (8 * i)) and 0xFF).toByte()
         }
 
-        /** GPS-Frame: Cmd 0x35 (UploadGPS) + lat/lon/alt als float64 LE. */
-        fun buildGpsFrame(lat: Double, lon: Double, alt: Double): ByteArray {
+        private fun buildGpsFrame(lat: Double, lon: Double, alt: Double): ByteArray {
             val payload = ByteArray(24)
             putDoubleLE(payload, 0, lat)
             putDoubleLE(payload, 8, lon)
             putDoubleLE(payload, 16, alt)
-            return buildHeader16Message(0x35, payload)
+            return buildHeader16Message(0x35, payload) // 0x35 = UploadGPS
         }
 
-        /** Letzter Fix, der an die Kamera gestreamt werden soll. */
-        @Volatile
-        var pendingFix: dev.hansel.insta360remote.location.GpsFix? = null
-
-        /**
-         * Sendet den uebergebenen Fix als UploadGPS-Kommando an die Kamera
-         * (Modell B: wir sind Central, Kamera-GATT-Server hostet be81).
-         */
         @SuppressLint("MissingPermission")
-        fun sendGpsFix(fix: dev.hansel.insta360remote.location.GpsFix): Boolean {
-            val wc = writeCharacteristic ?: return false
-            val g = gatt ?: return false
-            if (fix.fixQuality == dev.hansel.insta360remote.location.GpsFix.FixQuality.NO_FIX) {
-                return false // Kein gueltiger Fix - nichts senden.
-            }
-            return try {
-                wc.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-                wc.value = buildGpsFrame(fix.latitude, fix.longitude, fix.altitudeMeters)
-                val ok = g.writeCharacteristic(wc)
+        fun sendGpsFixInternal(g: BluetoothGatt, fix: dev.hansel.insta360remote.location.GpsFix): Boolean {
+            if (fix.fixQuality == dev.hansel.insta360remote.location.GpsFix.FixQuality.NO_FIX) return false
+            if (writeCharacteristic == null) return false
+            val frame = buildGpsFrame(fix.latitude, fix.longitude, fix.altitudeMeters)
+            try {
+                writeCharacteristic!!.writeType =
+                    BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                writeCharacteristic!!.value = frame
+                val ok = g.writeCharacteristic(writeCharacteristic!!)
                 if (ok) {
                     Diagnostics.log(
                         TAG,
-                        "GPS gesendet: lat=" + fix.latitude + " lon=" + fix.longitude +
-                            " alt=" + fix.altitudeMeters
+                        "GPS gesendet: lat=" + fix.latitude + " lon=" + fix.longitude
                     )
                 }
-                ok
+                return ok
             } catch (e: Exception) {
-                Diagnostics.log(TAG, "GPS-Write fehlgeschlagen: ${e.message}")
-                false
+                Diagnostics.log(TAG, "GPS-Write fehlgeschlagen: " + e.message)
+                return false
             }
-        }
-
-        @SuppressLint("MissingPermission")
-        private fun startGpsStream(g: BluetoothGatt) {
-            Diagnostics.log(TAG, "Starte GPS-Stream (Cmd 0x35 UploadGPS) auf be81")
-            val tick = object : Runnable {
-                override fun run() {
-                    val fix = pendingFix ?: return
-                    sendGpsFix(fix)
-                    keepaliveHandler.postDelayed(this, 1000)
-                }
-            }
-            keepaliveHandler.post(tick)
-        }
-
-        private fun stopKeepalive() {
-            keepaliveRunning = false
-            keepaliveHandler.removeCallbacksAndMessages(null)
         }
 
         @Suppress("DEPRECATION")
@@ -364,7 +251,8 @@ object CameraClient {
         ) {
             Diagnostics.log(
                 TAG,
-                "READ ${characteristic.uuid} status=$status value=${Diagnostics.hex(characteristic.value)}"
+                "READ " + characteristic.uuid + " status=" + status +
+                    " value=" + Diagnostics.hex(characteristic.value)
             )
         }
 
@@ -375,9 +263,20 @@ object CameraClient {
         ) {
             Diagnostics.log(
                 TAG,
-                "NOTIFY von Kamera ${characteristic.uuid}: ${Diagnostics.hex(characteristic.value)}"
+                "NOTIFY von Kamera " + characteristic.uuid + ": " + Diagnostics.hex(characteristic.value)
             )
         }
     }
+
+    /** Sendet einen Fix per UploadGPS (Cmd 0x35) an den Kamera-Server. */
+    fun sendGpsFix(fix: dev.hansel.insta360remote.location.GpsFix): Boolean {
+        val g = gatt ?: return false
+        return callback.sendGpsFixInternal(g, fix)
+    }
 }
+
+
+
+
+
 

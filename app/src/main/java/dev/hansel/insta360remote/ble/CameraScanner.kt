@@ -94,10 +94,10 @@ object CameraScanner {
                 Diagnostics.log(TAG, ">>> KAMERA GEFUNDEN: name=$name addr=${result.device.address} rssi=${result.rssi}")
                 Diagnostics.log(TAG, "    uuids=$uuids")
                 Diagnostics.log(TAG, "    advBytes=${Diagnostics.hex(result.scanRecord?.bytes)}")
-                // HINWEIS: Central-Rollen-Versuch deaktiviert - das X4 erwartet
-                // laut Chwalek-Referenz das Modell "Kamera verbindet sich aufs
-                // Peripheral". CameraClient bleibt fuer Experimente erhalten.
-                // CameraClient.connect(context, result.device)
+                // Architektur B (gemaess xaionaro-go/insta360ctl): Wir verbinden
+                // uns als Central zum BE80-Server der Kamera und injizieren GPS
+                // per Cmd 0x35 UploadGPS - das ist der Weg fuer Geotagging.
+                CameraClient.connect(context, result.device)
             }
         }
     }
