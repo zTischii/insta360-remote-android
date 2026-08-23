@@ -119,7 +119,33 @@ object CameraClient {
         }
 
         private fun startTimers(g: BluetoothGatt) {
-            // Sync-Handshake (Typ 06 + Magic syNceNdinS).
+            // 1) Autorisierungs-Handshake (Cmd 39 CheckAuthorization +
+            //    Cmd 40 RequestAuthorization mit OperationType PAIR).
+            val camMac = connectingAddress ?: ""
+            val macBytes = camMac.toByteArray(Charsets.US_ASCII)
+            val checkPayload = ArrayList<Byte>()
+            checkPayload.add(0x0A)                    // Field 1, wire type 2
+            checkPayload.add(macBytes.size.toByte())
+            for (b in macBytes) checkPayload.add(b)
+            checkPayload.add(0x18)                    // Field 3, wire type 0
+            checkPayload.add(0x02)                    // INITIATOR_TYPE_APP
+            writeToBe81(
+                g,
+                buildHeader16Message(0x27, checkPayload.toByteArray()),
+                "CheckAuthorization"
+            )
+
+            // 2) 500 ms spaeter Pairing-Anfrage (loest Bestaetigung auf Kamera aus).
+            handler.postDelayed({
+                writeToBe81(
+                    g,
+                    buildHeader16Message(0x28, byteArrayOf(0x08, 0x01)),
+                    "RequestAuthorization(PAIR)"
+                )
+                Diagnostics.log(TAG, "BITTE AUF DER KAMERA BESTAETIGEN!")
+            }, 500)
+
+            // 3) Sync-Handshake (Typ 06 + Magic syNceNdinS).
             val sync = ByteArray(20)
             sync[0] = 0x14
             sync[4] = 0x06
