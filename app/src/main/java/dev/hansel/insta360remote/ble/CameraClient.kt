@@ -51,16 +51,26 @@ object CameraClient {
         override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
-                    Diagnostics.log(TAG, "Mit Kamera verbunden - starte Service-Discovery")
-                    g.discoverServices()
+                    Diagnostics.log(TAG, "Mit Kamera verbunden - requestMtu(517)")
+                    // Wie ESP32-Referenz: MTU-Anforderung vor der Discovery.
+                    if (!g.requestMtu(517)) {
+                        Diagnostics.log(TAG, "requestMtu abgelehnt - mache direkt Discovery")
+                        g.discoverServices()
+                    }
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
                     Diagnostics.log(TAG, "Kamera-Verbindung getrennt (status=$status)")
+                    stopKeepalive()
                     try { g.close() } catch (_: Exception) {}
                     gatt = null
                     connectingAddress = null
                 }
             }
+        }
+
+        override fun onMtuChanged(g: BluetoothGatt, mtu: Int, status: Int) {
+            Diagnostics.log(TAG, "MTU ausgehandelt: $mtu (status=$status)")
+            g.discoverServices()
         }
 
         @SuppressLint("MissingPermission")
@@ -126,6 +136,85 @@ object CameraClient {
                 }
             }
             Diagnostics.log(TAG, "Alle Read-Versuche abgeschickt - Kamera-Link vollstaendig aufgebaut")
+
+            // Schritt 3: be81-Write-Charakteristik merken und Keepalive starten
+            // (Status-Poll 0x04/0x0F im 1-Hz-Takt wie die ESP32-Referenz).
+            writeCharacteristic = g.getService(
+                java.util.UUID.fromString("0000be80-0000-1000-8000-00805f9b34fb")
+            )?.getCharacteristic(
+                java.util.UUID.fromString("0000be81-0000-1000-8000-00805f9b34fb")
+            )
+            if (writeCharacteristic != null) {
+                startKeepalive(g)
+            } else {
+                Diagnostics.log(TAG, "WARNUNG: be81 (write) nicht gefunden!")
+            }
+        }
+
+        // ------------------------------------------------------------ Kommandos
+
+        private var writeCharacteristic: BluetoothGattCharacteristic? = null
+
+        /** SN-Zaehler, Startwert 5120 (0x1400) gemaess ESP32-Referenz. */
+        private var sn = 5120
+
+        /**
+         * Exakte Replik von create_cmd() aus dem funktionierenden One-X2-Remote:
+         * [total_len][00 00 00][mode][00 00][c1][00][sn_hi][sn_lo][00 00 80 00 00]
+         * [protobuf-payload ab Offset 16]
+         */
+        private fun buildCmd(mode: Int, c1: Int?, payload: ByteArray?): ByteArray {
+            val pb = payload ?: ByteArray(0)
+            val cmd = ByteArray(16 + pb.size)
+            cmd[4] = mode.toByte()
+            var len = 7
+            if (c1 != null && c1 != 0xFF) {
+                cmd[7] = c1.toByte()
+                cmd[8] = 0
+                cmd[9] = ((sn shr 8) and 0xFF).toByte()
+                cmd[10] = (sn and 0xFF).toByte()
+                sn++
+                cmd[11] = 0x00
+                cmd[12] = 0
+                cmd[13] = 0x80.toByte()
+                cmd[14] = 0
+                cmd[15] = 0
+                len += 9
+            }
+            pb.copyInto(cmd, 16)
+            cmd[0] = (len + pb.size).toByte()
+            return cmd.copyOf(len + pb.size)
+        }
+
+        private val keepaliveHandler = android.os.Handler(android.os.Looper.getMainLooper())
+        private var keepaliveRunning = false
+
+        @SuppressLint("MissingPermission")
+        private fun startKeepalive(g: BluetoothGatt) {
+            if (keepaliveRunning) return
+            keepaliveRunning = true
+            Diagnostics.log(TAG, "Starte 1Hz-Status-Poll (0x04/0x0F) auf be81")
+            val tick = object : Runnable {
+                override fun run() {
+                    val wc = writeCharacteristic
+                    if (!keepaliveRunning || wc == null) return
+                    try {
+                        wc.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                        wc.value = buildCmd(0x04, 0x0F, null)
+                        val ok = g.writeCharacteristic(wc)
+                        if (!ok) Diagnostics.log(TAG, "writeCharacteristic lieferte false")
+                    } catch (e: Exception) {
+                        Diagnostics.log(TAG, "Keepalive-Write fehlgeschlagen: ${e.message}")
+                    }
+                    keepaliveHandler.postDelayed(this, 1000)
+                }
+            }
+            keepaliveHandler.post(tick)
+        }
+
+        private fun stopKeepalive() {
+            keepaliveRunning = false
+            keepaliveHandler.removeCallbacksAndMessages(null)
         }
 
         @Suppress("DEPRECATION")
