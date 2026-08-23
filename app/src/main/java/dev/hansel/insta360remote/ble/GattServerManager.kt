@@ -51,6 +51,10 @@ class GattServerManager(
     private val snCounter = Insta360Protocol.SequenceCounter()
     private val assembler = Insta360Protocol.FrameAssembler()
 
+    /** Anzahl der Services, deren Registrierung wir abwarten (siehe start()). */
+    private var pendingServiceAdds = 0
+    private var confirmedServiceAdds = 0
+
     private val notifyCharacteristic: BluetoothGattCharacteristic?
         get() = gattServer?.services
             ?.firstOrNull { it.uuid == Insta360Uuids.SERVICE_UUID }
@@ -82,10 +86,14 @@ class GattServerManager(
                 return false
             }
             gattServer = server
+            // WICHTIG: Advertising erst starten, wenn ALLE Services vom Stack
+            // bestaetigt sind (onServiceAdded). Sonst kann die Kamera waehrend
+            // der Registrierung connecten, findet eine leere GATT-DB und
+            // trennt sofort wieder.
+            confirmedServiceAdds = 0
+            pendingServiceAdds = 2
             server.addService(Insta360Uuids.buildService())
             server.addService(Insta360Uuids.buildSecondaryService())
-            startAdvertising()
-            ServiceStatus.setBleState(BleConnectionState.Advertising)
             true
         } catch (e: Exception) {
             Diagnostics.log(TAG, "Start fehlgeschlagen: ${e.message}")
@@ -97,6 +105,7 @@ class GattServerManager(
     fun stop() {
         try { advertiser?.stopAdvertising(advertiseCallback) } catch (_: Exception) {}
         advertising = false
+        CameraScanner.stop()
         try { gattServer?.close() } catch (_: Exception) {}
         gattServer = null
         synchronized(clients) { clients.clear() }
@@ -143,18 +152,18 @@ class GattServerManager(
             .setTimeout(0)
             .build()
 
-        // Wie die ESP32-Referenz: BEIDE Service-UUIDs im Adv-Payload
-        // (16-bit ce80 + 128-bit Sekundaerservice = 25 Bytes, passt in 31),
-        // der Geraetename liegt im Scan-Response.
+        // Variante 2: Name + 16-bit ce80 direkt im Adv-Paket (28 Bytes, passt in
+        // 31), falls die Kamera passiv scannt und den Scan-Response nie liest.
+        // Der 128-bit Sekundaerservice liegt im Scan-Response.
         val advertiseData = AdvertiseData.Builder()
-            .setIncludeDeviceName(false)
+            .setIncludeDeviceName(true)
             .setIncludeTxPowerLevel(false)
             .addServiceUuid(Insta360Uuids.SERVICE_PARCEL_UUID)
-            .addServiceUuid(Insta360Uuids.SECONDARY_SERVICE_PARCEL_UUID)
             .build()
 
         val scanResponse = AdvertiseData.Builder()
-            .setIncludeDeviceName(true)
+            .setIncludeDeviceName(false)
+            .addServiceUuid(Insta360Uuids.SECONDARY_SERVICE_PARCEL_UUID)
             .build()
 
         adv.startAdvertising(settings, advertiseData, scanResponse, advertiseCallback)
@@ -208,6 +217,15 @@ class GattServerManager(
 
         override fun onServiceAdded(status: Int, service: android.bluetooth.BluetoothGattService?) {
             Diagnostics.log(TAG, "onServiceAdded status=$status uuid=${service?.uuid}")
+            if (status == BluetoothGatt.GATT_SUCCESS && service?.uuid != null) {
+                confirmedServiceAdds++
+                if (confirmedServiceAdds >= pendingServiceAdds && pendingServiceAdds > 0) {
+                    Diagnostics.log(TAG, "Alle $confirmedServiceAdds Services registriert - starte Advertising")
+                    startAdvertising()
+                    CameraScanner.start(context)
+                    ServiceStatus.setBleState(BleConnectionState.Advertising)
+                }
+            }
         }
 
         override fun onMtuChanged(device: BluetoothDevice?, mtu: Int) {
