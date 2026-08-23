@@ -15,6 +15,7 @@ import androidx.lifecycle.lifecycleScope
 import dev.hansel.insta360remote.MainActivity
 import dev.hansel.insta360remote.R
 import dev.hansel.insta360remote.ble.BestGuessGpsPayloadEncoder
+import dev.hansel.insta360remote.ble.CameraClient
 import dev.hansel.insta360remote.ble.GattServerManager
 import dev.hansel.insta360remote.core.AppPreferences
 import dev.hansel.insta360remote.core.BleConnectionState
@@ -80,7 +81,11 @@ class GpsRemoteService : LifecycleService() {
             try {
                 locationController!!.fixes(lifecycleScope).collect { fix ->
                     ServiceStatus.setLastFix(fix)
+                    // Weg A: Peripheral-Notify (falls Kamera uns verbunden hat).
                     gattServerManager?.broadcastFix(fix)
+                    // Weg B: Central-GPS-Injection (Cmd 0x35 UploadGPS, falls
+                    // wir mit dem be80-Server der Kamera verbunden sind).
+                    CameraClient.sendGpsFix(fix)
                 }
             } catch (e: Exception) {
                 Diagnostics.log(TAG, "Location-Pipeline beendet: ${e.message}")
