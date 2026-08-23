@@ -1,4 +1,4 @@
-package dev.hansel.insta360remote.ble
+﻿package dev.hansel.insta360remote.ble
 
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothGatt
@@ -18,16 +18,13 @@ import dev.hansel.insta360remote.core.Diagnostics
 import dev.hansel.insta360remote.core.ServiceStatus
 
 /**
- * Verwaltet die BLE-Peripheral-Rolle: Advertising + GATT-Server.
+ * BLE-Peripheral-Rolle: Advertising + GATT-Server.
  *
- * Die Kamera ist BLE-Central und verbindet sich mit uns (wie zum originalen
- * GPS-Remote). Wir senden GPS-Daten periodisch per Notify auf CHAR_NOTIFY_UUID
- * und empfangen Kommandos auf CHAR_WRITE_UUID.
- *
- * Reconnect-Strategie: Das Advertising bleibt dauerhaft aktiv; geht die Kamera
- * ausser Reichweite, trennt die Verbindung und verbindet sich beim Wiederkommen
- * erneut - wir muessen dafuer nur sicherstellen, dass das Advertising weiter-
- * laeuft (wird in onConnectionStateChange geprueft).
+ * Live-Erkenntnisse X4: Der OEM-Stack stellt onServiceAdded/
+ * onDescriptorWriteRequest teils NICHT an die App zu. Daher eigene
+ * Characteristic-Referenzen, Advertising per Timeout-Fallback und Broadcasts
+ * an ALLE verbundenen Geraete. Die Kamera trennt nach ca. 30s ohne
+ * Datenstrom -> letzten Fix alle 2s wiederholen.
  */
 class GattServerManager(
     private val context: Context,
@@ -41,30 +38,23 @@ class GattServerManager(
     private var advertiser: BluetoothLeAdvertiser? = null
     private var advertising = false
 
-    /** Verbundene Centrals (normalerweise max. 1: die Kamera). */
     private val clients = LinkedHashSet<BluetoothDevice>()
-
-    /** Devices, deren CCCD auf Notify gestellt wurde. */
-    private val notifySubscribers = LinkedHashSet<BluetoothDevice>()
 
     private var negotiatedMtu = DEFAULT_MTU
     private val snCounter = Insta360Protocol.SequenceCounter()
     private val assembler = Insta360Protocol.FrameAssembler()
 
-    /** Anzahl der Services, deren Registrierung wir abwarten (siehe start()). */
     private var pendingServiceAdds = 0
     private var confirmedServiceAdds = 0
 
-    /** letzter Fix fuer periodisches Wiederholen (GPS-Remotes streamen kontinuierlich). */
     @Volatile
     private var lastFix: dev.hansel.insta360remote.location.GpsFix? = null
 
     private val resendHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var resendRunning = false
 
-    private val notifyCharacteristic: BluetoothGattCharacteristic?
-        get() = gattServer?.services
-            ?.firstOrNull { it.uuid == Insta360Uuids.SERVICE_UUID }
-            ?.getCharacteristic(Insta360Uuids.CHAR_NOTIFY_UUID)
+    private var notifyCharRef: BluetoothGattCharacteristic? = null
+
 
     // ------------------------------------------------------------ Start/Stop
 
@@ -74,7 +64,6 @@ class GattServerManager(
             Diagnostics.log(TAG, "BLUETOOTH_CONNECT nicht gewaehrt - Start abgebrochen")
             return false
         }
-        // openGattServer liefert null, wenn Bluetooth aus ist - hier explizit pruefen.
         val adapter = bluetoothManager.adapter
         if (adapter == null) {
             Diagnostics.log(TAG, "Kein Bluetooth-Adapter vorhanden")
@@ -92,29 +81,22 @@ class GattServerManager(
                 return false
             }
             gattServer = server
-            Diagnostics.log(TAG, "openGattServer erfolgreich - registriere 2 Services")
-            // WICHTIG: Advertising erst starten, wenn ALLE Services vom Stack
-            // bestaetigt sind (onServiceAdded). Sonst kann die Kamera waehrend
-            // der Registrierung connecten, findet eine leere GATT-DB und
-            // trennt sofort wieder.
             confirmedServiceAdds = 0
             pendingServiceAdds = 2
-            server.addService(Insta360Uuids.buildService())
+            val primaryService = Insta360Uuids.buildService()
+            notifyCharRef = primaryService.getCharacteristic(Insta360Uuids.CHAR_NOTIFY_UUID)
+            server.addService(primaryService)
             server.addService(Insta360Uuids.buildSecondaryService())
             Diagnostics.log(TAG, "addService() fuer beide Services abgeschickt")
 
-            // FALLBACK: Manche OEM-BT-Stacks dispatchen onServiceAdded nicht an
-            // die App. Ohne Bestaetigung wuerde Advertising nie starten. Daher
-            // nach 600 ms erzwungener Start: Die Services sind dann praktisch
-            // registriert (die Stack-Bestätigungen kamen in allen Tests sofort).
+            // Fallback fuer Stacks ohne onServiceAdded-Dispatch.
             android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
                 if (gattServer != null && !advertising &&
                     confirmedServiceAdds < pendingServiceAdds
                 ) {
                     Diagnostics.log(
                         TAG,
-                        "onServiceAdded blieb aus ($confirmedServiceAdds/$pendingServiceAdds)" +
-                            " - starte Advertising nach Timeout"
+                        "onServiceAdded blieb aus ($confirmedServiceAdds/$pendingServiceAdds) - starte Advertising nach Timeout"
                     )
                     confirmedServiceAdds = pendingServiceAdds
                     startAdvertising()
@@ -134,10 +116,10 @@ class GattServerManager(
         try { advertiser?.stopAdvertising(advertiseCallback) } catch (_: Exception) {}
         advertising = false
         CameraScanner.stop()
+        stopResendLoop()
         try { gattServer?.close() } catch (_: Exception) {}
         gattServer = null
         synchronized(clients) { clients.clear() }
-        synchronized(notifySubscribers) { notifySubscribers.clear() }
         assembler.reset()
         ServiceStatus.setBleState(BleConnectionState.Idle)
         Diagnostics.log(TAG, "GattServerManager gestoppt")
@@ -152,7 +134,6 @@ class GattServerManager(
 
     @android.annotation.SuppressLint("MissingPermission")
     private fun startAdvertising() {
-        Diagnostics.log(TAG, "startAdvertising() aufgerufen (advertising=$advertising)")
         val adapter = bluetoothManager.adapter
         val adv = adapter?.bluetoothLeAdvertiser
         if (adv == null) {
@@ -161,19 +142,17 @@ class GattServerManager(
         }
         advertiser = adv
 
-        // Geraetename wie das Original-Remote setzen - die Kamera findet uns
-        // (zumindest teilweise) ueber den Namen "Insta360 GPS Remote".
         try {
             if (adapter.name != Insta360Uuids.REMOTE_DEVICE_NAME) {
                 adapter.name = Insta360Uuids.REMOTE_DEVICE_NAME
-                Diagnostics.log(TAG, "Bluetooth-Name gesetzt: ${Insta360Uuids.REMOTE_DEVICE_NAME}")
+                Diagnostics.log(TAG, "Bluetooth-Name gesetzt: " + Insta360Uuids.REMOTE_DEVICE_NAME)
             }
         } catch (e: Exception) {
-            Diagnostics.log(TAG, "Konnte Bluetooth-Namen nicht setzen: ${e.message}")
+            Diagnostics.log(TAG, "Konnte Bluetooth-Namen nicht setzen: " + e.message)
         }
 
-        // ADVERTISE_MODE_BALANCED als Kompromiss: schnellere Connectbarkeit als
-        // LOW_POWER, deutlich weniger Strom als LOW_LATENCY-Dauerbetrieb.
+        // EXAKT wie die ESP32-Referenz (Chwalek): beide Service-UUIDs inkl.
+        // TX-Power im Adv-Paket, Name im Scan-Response.
         val settings = AdvertiseSettings.Builder()
             .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_BALANCED)
             .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_MEDIUM)
@@ -181,11 +160,6 @@ class GattServerManager(
             .setTimeout(0)
             .build()
 
-        // EXAKT wie die ESP32-Referenz (Chwalek-Medium-Artikel): BEIDE
-        // Service-UUIDs im Adv-Paket (16-bit ce80 + 128-bit Sekundaerservice,
-        // inkl. TX-Power), der Geraetename "Insta360 GPS Remote" im Scan-
-        // Response. Genau dieses Layout fuehrte bereits zu "Remote verbunden"
-        // auf der Kamera.
         val advertiseData = AdvertiseData.Builder()
             .setIncludeDeviceName(false)
             .setIncludeTxPowerLevel(true)
@@ -198,7 +172,7 @@ class GattServerManager(
             .build()
 
         adv.startAdvertising(settings, advertiseData, scanResponse, advertiseCallback)
-        Diagnostics.log(TAG, "Advertising gestartet (${Insta360Uuids.SERVICE_UUID})")
+        Diagnostics.log(TAG, "Advertising gestartet (" + Insta360Uuids.SERVICE_UUID + ")")
     }
 
     private fun restartAdvertisingIfStopped() {
@@ -210,31 +184,17 @@ class GattServerManager(
 
     // ------------------------------------------------------------ GPS-Sendung
 
-    /**
-     * Sendet einen GPS-Fix an alle angemeldeten Kamera-Clients. Der Frame wird
-     * in (MTU-3)-Byte-Brocken fragmentiert und je Brocken ein Notify ausgeloest
-     * (confirm=false, um nicht auf Acks zu warten -> weniger CPU-Wachzeit).
-     */
-    /** true, sobald der erste "Charakteristik nicht bereit"-Fall geloggt wurde. */
-    private var loggedMissingCharacteristic = false
-
     fun broadcastFix(fix: dev.hansel.insta360remote.location.GpsFix) {
         lastFix = fix
-        val characteristic = notifyCharacteristic
-        if (characteristic == null) {
-            if (!loggedMissingCharacteristic) {
-                loggedMissingCharacteristic = true
-                Diagnostics.log(TAG, "Notify-Charakteristik nicht bereit - Fixes werden verworfen (nur einmal gemeldet)")
-            }
+        val characteristic = notifyCharRef ?: run {
+            Diagnostics.log(TAG, "Notify-Charakteristik nicht bereit - Fix verworfen")
             return
         }
-        // An ALLE verbundenen Geraete senden - der Stack verwaltet CCCD-States
-        // selbst und liefert nur an tatsaechlich abonnierte Central aus. Unsere
-        // eigene Subscriber-Buchhaltung ist unzuverlaessig (Callback-Luecke).
+        // An ALLE verbundenen Geraete senden - der Stack liefert Notify nur an
+        // tatsaechlich Abonnierte (CCCD-Verwaltung liegt im Stack).
         val targets = synchronized(clients) { clients.toList() }
         if (targets.isEmpty()) return
 
-        loggedMissingCharacteristic = false
         val frame = encoder.encodeGpsUpdate(fix, snCounter.next())
         val chunks = Insta360Protocol.fragment(frame, negotiatedMtu - ATT_HEADER_SIZE)
 
@@ -245,7 +205,7 @@ class GattServerManager(
                 val ok = try {
                     gattServer?.notifyCharacteristicChanged(device, characteristic, false) ?: false
                 } catch (e: Exception) {
-                    Diagnostics.log(TAG, "notify fehlgeschlagen: ${e.message}")
+                    Diagnostics.log(TAG, "notify fehlgeschlagen: " + e.message)
                     false
                 }
                 if (ok) delivered++
@@ -256,11 +216,7 @@ class GattServerManager(
         startResendLoop()
     }
 
-    /**
-     * GPS-Remotes senden ihren Fix kontinuierlich; ohne Datenstrom trennt die
-     * Kamera nach ~30s Idle. Daher den letzten Fix alle 2s wiederholen,
-     * solange ein Client verbunden ist.
-     */
+    /** Letzten Fix alle 2s wiederholen - verhindert den 30s-Idle-Drop. */
     private fun startResendLoop() {
         if (resendRunning) return
         resendRunning = true
@@ -278,8 +234,10 @@ class GattServerManager(
         }, 2000)
     }
 
-    @Volatile
-    private var resendRunning = false
+    private fun stopResendLoop() {
+        resendRunning = false
+        resendHandler.removeCallbacksAndMessages(null)
+    }
 
     // ------------------------------------------------------------ GATT-Callbacks
 
@@ -287,11 +245,11 @@ class GattServerManager(
     private val serverCallback = object : BluetoothGattServerCallback() {
 
         override fun onServiceAdded(status: Int, service: android.bluetooth.BluetoothGattService?) {
-            Diagnostics.log(TAG, "onServiceAdded status=$status uuid=${service?.uuid}")
+            Diagnostics.log(TAG, "onServiceAdded status=" + status + " uuid=" + (service?.uuid))
             if (status == BluetoothGatt.GATT_SUCCESS && service?.uuid != null) {
                 confirmedServiceAdds++
                 if (confirmedServiceAdds >= pendingServiceAdds && pendingServiceAdds > 0) {
-                    Diagnostics.log(TAG, "Alle $confirmedServiceAdds Services registriert - starte Advertising")
+                    Diagnostics.log(TAG, "Alle Services registriert - starte Advertising")
                     startAdvertising()
                     CameraScanner.start(context)
                     ServiceStatus.setBleState(BleConnectionState.Advertising)
@@ -301,7 +259,7 @@ class GattServerManager(
 
         override fun onMtuChanged(device: BluetoothDevice?, mtu: Int) {
             negotiatedMtu = mtu.coerceAtLeast(DEFAULT_MTU)
-            Diagnostics.log(TAG, "MTU ausgehandelt: $negotiatedMtu (Device=${device?.address})")
+            Diagnostics.log(TAG, "MTU ausgehandelt: " + negotiatedMtu)
         }
 
         override fun onConnectionStateChange(device: BluetoothDevice?, status: Int, newState: Int) {
@@ -313,32 +271,28 @@ class GattServerManager(
                     ServiceStatus.setBleState(
                         BleConnectionState.Connected(device.name, address)
                     )
-                    Diagnostics.log(TAG, "Kamera verbunden: $address name=${device.name}")
-                    // Sofort einen Platzhalter-Fix senden, damit die Kamera nie
-                    // einen leeren Idle-Zeitfenster sieht (30s-Drop vermeiden).
+                    Diagnostics.log(TAG, "Kamera verbunden: " + address)
+
                     if (lastFix == null) {
                         lastFix = dev.hansel.insta360remote.location.GpsFix(
-                            latitude = 0.0,
-                            longitude = 0.0,
-                            altitudeMeters = 0.0,
-                            speedMps = 0f,
-                            bearingDeg = 0f,
-                            horizontalAccuracyMeters = 0f,
+                            latitude = 0.0, longitude = 0.0, altitudeMeters = 0.0,
+                            speedMps = 0f, bearingDeg = 0f, horizontalAccuracyMeters = 0f,
                             utcEpochMillis = System.currentTimeMillis(),
                             satelliteCount = 0,
                             fixQuality = dev.hansel.insta360remote.location.GpsFix.FixQuality.NO_FIX
                         )
                         Diagnostics.log(TAG, "Platzhalter-Fix gesetzt (kein GPS-Fix bisher)")
                     }
+                    startResendLoop()
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
                     synchronized(clients) { clients.remove(device) }
-                    synchronized(notifySubscribers) { notifySubscribers.remove(device) }
                     assembler.reset()
                     val stillConnected = synchronized(clients) { clients.isNotEmpty() }
                     if (!stillConnected) {
+                        stopResendLoop()
                         ServiceStatus.setBleState(BleConnectionState.Advertising)
-                        Diagnostics.log(TAG, "Kamera getrennt (status=$status) - warte auf Reconnect")
+                        Diagnostics.log(TAG, "Kamera getrennt (status=" + status + ") - warte auf Reconnect")
                         restartAdvertisingIfStopped()
                     }
                 }
@@ -359,10 +313,7 @@ class GattServerManager(
 
             when (characteristic.uuid) {
                 Insta360Uuids.CHAR_WRITE_UUID -> handleCameraFrame(device, value)
-                else -> Diagnostics.log(
-                    TAG,
-                    "Write an ${characteristic.uuid} (unbehandelt): ${Diagnostics.hex(value)}"
-                )
+                else -> Diagnostics.log(TAG, "Write an " + characteristic.uuid + ": " + Diagnostics.hex(value))
             }
 
             if (responseNeeded) {
@@ -384,13 +335,11 @@ class GattServerManager(
             if (descriptor.uuid == Insta360Uuids.CCCD_UUID &&
                 descriptor.characteristic.uuid == Insta360Uuids.CHAR_NOTIFY_UUID
             ) {
-                val enableNotifications = (value[0].toInt() and 0x01) != 0
-                if (enableNotifications) {
-                    synchronized(notifySubscribers) { notifySubscribers.add(device) }
-                    Diagnostics.log(TAG, "Kamera hat Notifies aktiviert (${device.address})")
+                val enable = (value[0].toInt() and 0x01) != 0
+                if (enable) {
+                    Diagnostics.log(TAG, "Kamera hat Notifies aktiviert (" + device.address + ")")
                 } else {
-                    synchronized(notifySubscribers) { notifySubscribers.remove(device) }
-                    Diagnostics.log(TAG, "Kamera hat Notifies deaktiviert (${device.address})")
+                    Diagnostics.log(TAG, "Kamera hat Notifies deaktiviert (" + device.address + ")")
                 }
             }
 
@@ -400,32 +349,24 @@ class GattServerManager(
         }
 
         override fun onCharacteristicReadRequest(
-        device: BluetoothDevice?,
-        requestId: Int,
-        offset: Int,
-        characteristic: BluetoothGattCharacteristic?,
-    ) {
-        if (device == null || characteristic == null) return
-        // KRITISCH: Jeder Read-Request MUSS beantwortet werden, sonst haengt
-        // das GATT und die Kamera trennt nach ~30s Timeout.
-        val value = characteristic.value ?: ByteArray(0)
-        val response = if (offset < value.size) {
-            value.copyOfRange(offset, value.size)
-        } else {
-            ByteArray(0)
+            device: BluetoothDevice?,
+            requestId: Int,
+            offset: Int,
+            characteristic: BluetoothGattCharacteristic?,
+        ) {
+            if (device == null || characteristic == null) return
+            // KRITISCH: Read-Requests MUESSEN beantwortet werden.
+            val value = characteristic.value ?: ByteArray(0)
+            val response = if (offset < value.size) value.copyOfRange(offset, value.size) else ByteArray(0)
+            try {
+                gattServer?.sendResponse(
+                    device, requestId, BluetoothGatt.GATT_SUCCESS, offset, response
+                )
+                Diagnostics.log(TAG, "READ-Request " + characteristic.uuid + " -> " + Diagnostics.hex(response))
+            } catch (e: Exception) {
+                Diagnostics.log(TAG, "sendResponse(Read) fehlgeschlagen: " + e.message)
+            }
         }
-        try {
-            gattServer?.sendResponse(
-                device, requestId, BluetoothGatt.GATT_SUCCESS, offset, response
-            )
-            Diagnostics.log(
-                TAG,
-                "READ-Request ${characteristic.uuid} offset=$offset -> ${Diagnostics.hex(response)}"
-            )
-        } catch (e: Exception) {
-            Diagnostics.log(TAG, "sendResponse(Read) fehlgeschlagen: ${e.message}")
-        }
-    }
 
         override fun onDescriptorReadRequest(
             device: BluetoothDevice?,
@@ -435,17 +376,13 @@ class GattServerManager(
         ) {
             if (device == null || descriptor == null) return
             val value = descriptor.value ?: ByteArray(0)
-            val response = if (offset < value.size) {
-                value.copyOfRange(offset, value.size)
-            } else {
-                ByteArray(0)
-            }
+            val response = if (offset < value.size) value.copyOfRange(offset, value.size) else ByteArray(0)
             try {
                 gattServer?.sendResponse(
                     device, requestId, BluetoothGatt.GATT_SUCCESS, offset, response
                 )
             } catch (e: Exception) {
-                Diagnostics.log(TAG, "sendResponse(DescRead) fehlgeschlagen: ${e.message}")
+                Diagnostics.log(TAG, "sendResponse(DescRead) fehlgeschlagen: " + e.message)
             }
         }
     }
@@ -454,27 +391,19 @@ class GattServerManager(
         try {
             gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, value)
         } catch (e: Exception) {
-            Diagnostics.log(TAG, "sendResponse fehlgeschlagen: ${e.message}")
+            Diagnostics.log(TAG, "sendResponse fehlgeschlagen: " + e.message)
         }
     }
 
-    /**
-     * Fuehrt empfangene (ggf. ueber mehrere Write-Requests verteilte)
-     * Kamera-Frames zusammen und loggt sie inkl. Hex-Dump - Basis fuer die
-     * Protokollverifikation per HCI-Snoop (siehe README).
-     */
     private fun handleCameraFrame(device: BluetoothDevice, chunk: ByteArray) {
         for (frame in assembler.feed(chunk)) {
             val commandId = if (frame.size >= 6) frame[5].toInt() and 0xFF else -1
             Diagnostics.log(
                 TAG,
-                "Frame von Kamera (${device.address}, cmd=0x%02X): %s"
-                    .format(commandId, Diagnostics.hex(frame))
+                "Frame von Kamera (" + device.address + ", cmd=0x%02X): %s".format(commandId, Diagnostics.hex(frame))
             )
         }
     }
-
-
 
     private val advertiseCallback = object : AdvertiseCallback() {
         override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
@@ -484,7 +413,7 @@ class GattServerManager(
 
         override fun onStartFailure(errorCode: Int) {
             advertising = false
-            Diagnostics.log(TAG, "Advertising fehlgeschlagen: $errorCode")
+            Diagnostics.log(TAG, "Advertising fehlgeschlagen: " + errorCode)
         }
     }
 
@@ -494,4 +423,3 @@ class GattServerManager(
         private const val ATT_HEADER_SIZE = 3
     }
 }
-

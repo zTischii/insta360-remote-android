@@ -88,7 +88,6 @@ object CameraClient {
             Diagnostics.log(TAG, "=== ENDE GATT-DATENBANK ===")
 
             // Schritt 1: Nur das CCCD von be82 aktivieren. GATT-Operationen sind
-            // strikt sequenziell - die Reads folgen im onDescriptorWrite-Callback.
             val be80Service = g.getService(java.util.UUID.fromString("0000be80-0000-1000-8000-00805f9b34fb"))
             val be82 = be80Service?.getCharacteristic(
                 java.util.UUID.fromString("0000be82-0000-1000-8000-00805f9b34fb")
