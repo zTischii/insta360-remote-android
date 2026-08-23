@@ -55,6 +55,12 @@ class GattServerManager(
     private var pendingServiceAdds = 0
     private var confirmedServiceAdds = 0
 
+    /** letzter Fix fuer periodisches Wiederholen (GPS-Remotes streamen kontinuierlich). */
+    @Volatile
+    private var lastFix: dev.hansel.insta360remote.location.GpsFix? = null
+
+    private val resendHandler = android.os.Handler(android.os.Looper.getMainLooper())
+
     private val notifyCharacteristic: BluetoothGattCharacteristic?
         get() = gattServer?.services
             ?.firstOrNull { it.uuid == Insta360Uuids.SERVICE_UUID }
@@ -213,6 +219,7 @@ class GattServerManager(
     private var loggedMissingCharacteristic = false
 
     fun broadcastFix(fix: dev.hansel.insta360remote.location.GpsFix) {
+        lastFix = fix
         val characteristic = notifyCharacteristic
         if (characteristic == null) {
             if (!loggedMissingCharacteristic) {
@@ -221,13 +228,17 @@ class GattServerManager(
             }
             return
         }
-        val targets = synchronized(notifySubscribers) { notifySubscribers.toList() }
-        if (targets.isEmpty()) return // Kamera noch nicht subscribed -> nichts senden
+        // An ALLE verbundenen Geraete senden - der Stack verwaltet CCCD-States
+        // selbst und liefert nur an tatsaechlich abonnierte Central aus. Unsere
+        // eigene Subscriber-Buchhaltung ist unzuverlaessig (Callback-Luecke).
+        val targets = synchronized(clients) { clients.toList() }
+        if (targets.isEmpty()) return
 
         loggedMissingCharacteristic = false
         val frame = encoder.encodeGpsUpdate(fix, snCounter.next())
         val chunks = Insta360Protocol.fragment(frame, negotiatedMtu - ATT_HEADER_SIZE)
 
+        var delivered = 0
         for (device in targets) {
             for (chunk in chunks) {
                 characteristic.value = chunk
@@ -237,11 +248,38 @@ class GattServerManager(
                     Diagnostics.log(TAG, "notify fehlgeschlagen: ${e.message}")
                     false
                 }
-                if (!ok) break
+                if (ok) delivered++
             }
         }
-        ServiceStatus.incrementNotifyCount(chunks.size.toLong())
+        ServiceStatus.incrementNotifyCount(delivered.toLong())
+
+        startResendLoop()
     }
+
+    /**
+     * GPS-Remotes senden ihren Fix kontinuierlich; ohne Datenstrom trennt die
+     * Kamera nach ~30s Idle. Daher den letzten Fix alle 2s wiederholen,
+     * solange ein Client verbunden ist.
+     */
+    private fun startResendLoop() {
+        if (resendRunning) return
+        resendRunning = true
+        resendHandler.postDelayed(object : Runnable {
+            override fun run() {
+                val fix = lastFix
+                val hasClients = synchronized(clients) { clients.isNotEmpty() }
+                if (fix == null || !hasClients) {
+                    resendRunning = false
+                    return
+                }
+                broadcastFix(fix)
+                resendHandler.postDelayed(this, 2000)
+            }
+        }, 2000)
+    }
+
+    @Volatile
+    private var resendRunning = false
 
     // ------------------------------------------------------------ GATT-Callbacks
 
@@ -276,6 +314,22 @@ class GattServerManager(
                         BleConnectionState.Connected(device.name, address)
                     )
                     Diagnostics.log(TAG, "Kamera verbunden: $address name=${device.name}")
+                    // Sofort einen Platzhalter-Fix senden, damit die Kamera nie
+                    // einen leeren Idle-Zeitfenster sieht (30s-Drop vermeiden).
+                    if (lastFix == null) {
+                        lastFix = dev.hansel.insta360remote.location.GpsFix(
+                            latitude = 0.0,
+                            longitude = 0.0,
+                            altitudeMeters = 0.0,
+                            speedMps = 0f,
+                            bearingDeg = 0f,
+                            horizontalAccuracyMeters = 0f,
+                            utcEpochMillis = System.currentTimeMillis(),
+                            satelliteCount = 0,
+                            fixQuality = dev.hansel.insta360remote.location.GpsFix.FixQuality.NO_FIX
+                        )
+                        Diagnostics.log(TAG, "Platzhalter-Fix gesetzt (kein GPS-Fix bisher)")
+                    }
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
                     synchronized(clients) { clients.remove(device) }
@@ -342,6 +396,56 @@ class GattServerManager(
 
             if (responseNeeded) {
                 sendResponse(device, requestId, value)
+            }
+        }
+
+        override fun onCharacteristicReadRequest(
+        device: BluetoothDevice?,
+        requestId: Int,
+        offset: Int,
+        characteristic: BluetoothGattCharacteristic?,
+    ) {
+        if (device == null || characteristic == null) return
+        // KRITISCH: Jeder Read-Request MUSS beantwortet werden, sonst haengt
+        // das GATT und die Kamera trennt nach ~30s Timeout.
+        val value = characteristic.value ?: ByteArray(0)
+        val response = if (offset < value.size) {
+            value.copyOfRange(offset, value.size)
+        } else {
+            ByteArray(0)
+        }
+        try {
+            gattServer?.sendResponse(
+                device, requestId, BluetoothGatt.GATT_SUCCESS, offset, response
+            )
+            Diagnostics.log(
+                TAG,
+                "READ-Request ${characteristic.uuid} offset=$offset -> ${Diagnostics.hex(response)}"
+            )
+        } catch (e: Exception) {
+            Diagnostics.log(TAG, "sendResponse(Read) fehlgeschlagen: ${e.message}")
+        }
+    }
+
+        override fun onDescriptorReadRequest(
+            device: BluetoothDevice?,
+            requestId: Int,
+            offset: Int,
+            descriptor: BluetoothGattDescriptor?,
+        ) {
+            if (device == null || descriptor == null) return
+            val value = descriptor.value ?: ByteArray(0)
+            val response = if (offset < value.size) {
+                value.copyOfRange(offset, value.size)
+            } else {
+                ByteArray(0)
+            }
+            try {
+                gattServer?.sendResponse(
+                    device, requestId, BluetoothGatt.GATT_SUCCESS, offset, response
+                )
+            } catch (e: Exception) {
+                Diagnostics.log(TAG, "sendResponse(DescRead) fehlgeschlagen: ${e.message}")
             }
         }
     }
