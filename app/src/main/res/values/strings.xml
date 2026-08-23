@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Insta360 GPS Remote</string>
+    <string name="status_header">Status</string>
+    <string name="status_service">Service: %s</string>
+    <string name="status_ble">BLE: %s</string>
+    <string name="status_last_fix">Letzter GPS-Fix:\n%s</string>
+    <string name="status_battery">Akku: %s</string>
+    <string name="btn_toggle_start">Service starten</string>
+    <string name="btn_toggle_stop">Service stoppen</string>
+    <string name="btn_permissions">Berechtigungen erteilen</string>
+    <string name="btn_background_location">Standort \u201eImmer erlauben\u201c</string>
+    <string name="btn_battery_opt">Akku-Optimierung deaktivieren</string>
+    <string name="btn_oem_settings">Hersteller-Energieeinstellungen öffnen</string>
+    <string name="oem_hint">%s</string>
+    <string name="log_header">Diagnose-Log</string>
+    <string name="notif_channel_name">GPS Remote aktiv</string>
+    <string name="notif_channel_desc">Hält die BLE-Verbindung zur Insta360-Kamera und den GPS-Fix aufrecht.</string>
+    <string name="notif_title">Insta360 GPS Remote läuft</string>
+    <string name="notif_text_waiting">Warte auf Kamera-Verbindung…</string>
+    <string name="notif_text_connected">Verbunden mit %1$s · %2$d GPS-Sends</string>
+</resources>
