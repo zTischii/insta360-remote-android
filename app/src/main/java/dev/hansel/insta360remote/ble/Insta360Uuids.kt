@@ -36,6 +36,15 @@ object Insta360Uuids {
     /** Offizieller Name des originalen Remotes - die Kamera findet uns darueber. */
     const val REMOTE_DEVICE_NAME = "Insta360 GPS Remote"
 
+    /**
+     * UUID, mit der das Remote ADVERTISED: Das X4-Pairing-Sniff zeigt, dass die
+     * Kamera selbst 16-bit-UUID 0xBE80 advertised und vermutlich gezielt nach
+     * Peripherals mit genau dieser UUID filtert (daher auch der "be8x"-Set-
+     * Geruecht). Die GATT-Dienste dahinter sind dagegen das ce8x-Set.
+     */
+    val ADVERTISED_SERVICE_UUID: UUID = uuid("be80")
+    val ADVERTISED_SERVICE_PARCEL_UUID: ParcelUuid = ParcelUuid(ADVERTISED_SERVICE_UUID)
+
     val SERVICE_UUID: UUID = uuid("ce80")
     val CHAR_WRITE_UUID: UUID = uuid("ce81")   // Kamera -> Remote (Kommandos)
     val CHAR_NOTIFY_UUID: UUID = uuid("ce82")  // Remote -> Kamera (Status/GPS, notify)

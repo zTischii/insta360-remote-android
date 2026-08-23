@@ -86,6 +86,7 @@ class GattServerManager(
                 return false
             }
             gattServer = server
+            Diagnostics.log(TAG, "openGattServer erfolgreich - registriere 2 Services")
             // WICHTIG: Advertising erst starten, wenn ALLE Services vom Stack
             // bestaetigt sind (onServiceAdded). Sonst kann die Kamera waehrend
             // der Registrierung connecten, findet eine leere GATT-DB und
@@ -94,6 +95,27 @@ class GattServerManager(
             pendingServiceAdds = 2
             server.addService(Insta360Uuids.buildService())
             server.addService(Insta360Uuids.buildSecondaryService())
+            Diagnostics.log(TAG, "addService() fuer beide Services abgeschickt")
+
+            // FALLBACK: Manche OEM-BT-Stacks dispatchen onServiceAdded nicht an
+            // die App. Ohne Bestaetigung wuerde Advertising nie starten. Daher
+            // nach 600 ms erzwungener Start: Die Services sind dann praktisch
+            // registriert (die Stack-Bestätigungen kamen in allen Tests sofort).
+            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                if (gattServer != null && !advertising &&
+                    confirmedServiceAdds < pendingServiceAdds
+                ) {
+                    Diagnostics.log(
+                        TAG,
+                        "onServiceAdded blieb aus ($confirmedServiceAdds/$pendingServiceAdds)" +
+                            " - starte Advertising nach Timeout"
+                    )
+                    confirmedServiceAdds = pendingServiceAdds
+                    startAdvertising()
+                    CameraScanner.start(context)
+                    ServiceStatus.setBleState(BleConnectionState.Advertising)
+                }
+            }, 600)
             true
         } catch (e: Exception) {
             Diagnostics.log(TAG, "Start fehlgeschlagen: ${e.message}")
@@ -124,6 +146,7 @@ class GattServerManager(
 
     @android.annotation.SuppressLint("MissingPermission")
     private fun startAdvertising() {
+        Diagnostics.log(TAG, "startAdvertising() aufgerufen (advertising=$advertising)")
         val adapter = bluetoothManager.adapter
         val adv = adapter?.bluetoothLeAdvertiser
         if (adv == null) {
@@ -152,13 +175,13 @@ class GattServerManager(
             .setTimeout(0)
             .build()
 
-        // Variante 2: Name + 16-bit ce80 direkt im Adv-Paket (28 Bytes, passt in
-        // 31), falls die Kamera passiv scannt und den Scan-Response nie liest.
-        // Der 128-bit Sekundaerservice liegt im Scan-Response.
+        // Adv-Paket wie das Original-Remote: Name + 16-bit UUID 0xBE80 (das ist
+        // das UUID-Set, nach dem die Kamera filtert - per Pairing-Sniff des X4
+        // verifiziert). Der 128-bit Sekundaerservice liegt im Scan-Response.
         val advertiseData = AdvertiseData.Builder()
             .setIncludeDeviceName(true)
             .setIncludeTxPowerLevel(false)
-            .addServiceUuid(Insta360Uuids.SERVICE_PARCEL_UUID)
+            .addServiceUuid(Insta360Uuids.ADVERTISED_SERVICE_PARCEL_UUID)
             .build()
 
         val scanResponse = AdvertiseData.Builder()
@@ -184,14 +207,22 @@ class GattServerManager(
      * in (MTU-3)-Byte-Brocken fragmentiert und je Brocken ein Notify ausgeloest
      * (confirm=false, um nicht auf Acks zu warten -> weniger CPU-Wachzeit).
      */
+    /** true, sobald der erste "Charakteristik nicht bereit"-Fall geloggt wurde. */
+    private var loggedMissingCharacteristic = false
+
     fun broadcastFix(fix: dev.hansel.insta360remote.location.GpsFix) {
-        val characteristic = notifyCharacteristic ?: run {
-            Diagnostics.log(TAG, "Notify-Charakteristik nicht bereit - Fix verworfen")
+        val characteristic = notifyCharacteristic
+        if (characteristic == null) {
+            if (!loggedMissingCharacteristic) {
+                loggedMissingCharacteristic = true
+                Diagnostics.log(TAG, "Notify-Charakteristik nicht bereit - Fixes werden verworfen (nur einmal gemeldet)")
+            }
             return
         }
         val targets = synchronized(notifySubscribers) { notifySubscribers.toList() }
         if (targets.isEmpty()) return // Kamera noch nicht subscribed -> nichts senden
 
+        loggedMissingCharacteristic = false
         val frame = encoder.encodeGpsUpdate(fix, snCounter.next())
         val chunks = Insta360Protocol.fragment(frame, negotiatedMtu - ATT_HEADER_SIZE)
 

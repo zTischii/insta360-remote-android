@@ -59,7 +59,7 @@ object CameraScanner {
         if (!running) return
         val callback = object : ScanCallback() {
             override fun onScanResult(callbackType: Int, result: ScanResult) {
-                inspect(result)
+                inspect(context, result)
             }
 
             override fun onScanFailed(errorCode: Int) {
@@ -79,7 +79,7 @@ object CameraScanner {
         }, CYCLE_SCAN_MS)
     }
 
-    private fun inspect(result: ScanResult) {
+    private fun inspect(context: Context, result: ScanResult) {
         val name = result.scanRecord?.deviceName ?: result.device.name
         val uuids = result.scanRecord?.serviceUuids?.joinToString { it.uuid.toString() }
         val interesting = name?.contains("insta", ignoreCase = true) == true ||
@@ -88,11 +88,19 @@ object CameraScanner {
             uuids?.contains("d0ff", ignoreCase = true) == true ||
             uuids?.contains("ffe0", ignoreCase = true) == true
         if (interesting) {
-            Diagnostics.log(TAG, ">>> KANDIDAT: name=$name addr=${result.device.address} rssi=${result.rssi}")
-            Diagnostics.log(TAG, "    uuids=$uuids")
-            Diagnostics.log(TAG, "    advBytes=${Diagnostics.hex(result.scanRecord?.bytes)}")
+            // Nur beim ersten Fund lautstark loggen (Spam vermeiden).
+            if (!announcedDevices.contains(result.device.address)) {
+                announcedDevices.add(result.device.address)
+                Diagnostics.log(TAG, ">>> KAMERA GEFUNDEN: name=$name addr=${result.device.address} rssi=${result.rssi}")
+                Diagnostics.log(TAG, "    uuids=$uuids")
+                Diagnostics.log(TAG, "    advBytes=${Diagnostics.hex(result.scanRecord?.bytes)}")
+                // Experiment: Rolle-Tausch-These - wir connecten als Central zur Kamera
+                CameraClient.connect(context, result.device)
+            }
         }
     }
+
+    private val announcedDevices = mutableSetOf<String>()
 
     private fun bluetoothLeScanner(context: Context): android.bluetooth.le.BluetoothLeScanner? {
         val bm = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
