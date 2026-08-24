@@ -75,8 +75,11 @@ object CameraClient {
                     Diagnostics.log(TAG, "Mit Kamera verbunden - requestMtu(517)")
                     // Wie ESP32-Referenz: MTU-Anforderung vor der Discovery.
                     if (!g.requestMtu(517)) {
-                        Diagnostics.log(TAG, "requestMtu abgelehnt - mache direkt Discovery")
-                        g.discoverServices()
+                        // Kein Fallback zur Discovery - im Bootstrap-Modus bewusst
+                        // inaktiv lassen statt Protokoll-Rauschen zu erzeugen.
+                        Diagnostics.log(TAG,
+                            "requestMtu abgelehnt - Bootstrap ohne MTU-Austausch! " +
+                                "Server-MTU bleibt dann vermutlich 23 (GPS-Frames wuerden gestutzt)")
                     }
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
@@ -91,7 +94,23 @@ object CameraClient {
 
         override fun onMtuChanged(g: BluetoothGatt, mtu: Int, status: Int) {
             Diagnostics.log(TAG, "MTU ausgehandelt: $mtu (status=$status)")
-            g.discoverServices()
+            // ------------------------------------------------------------
+            // BOOTSTRAP-MODUS - hier endet unsere Arbeit bewusst!
+            //
+            // Diese Central-Verbindung existiert nur zum Anstossen der
+            // MTU-Aushandlung. Empirischer Beleg (Testlog 17:49):
+            //   - requestMtu(517) durch uns  ->  ~600ms spaeter meldet der
+            //     GATT-SERVER onMtuChanged(mtu=251) fuer die Kamera-Verbindung,
+            //     und alle 88B-GPS-Frames gehen vollstaendig durch (abgelehnt=0).
+            //   - OHNE unseren Stoss bleibt der Server bei MTU 23 und Android
+            //     stutzt jedes Notify auf 20 Byte Muell (Testlog 18:05).
+            //
+            // Frueher machten wir hier noch Discovery + CCCD + Reads +
+            // Sync-/Keepalive-Writes auf be81 - letztere lieferten stets
+            // ok=false (WiFi-Protokoll-Framing, auf BLE bedeutungslos) und
+            // erzeugen nur Rauschen. Alles entfernt.
+            // ------------------------------------------------------------
+            Diagnostics.log(TAG, "Arch-B = MTU-Bootstrap abgeschlossen - Link bleibt idle offen")
         }
 
         @SuppressLint("MissingPermission")

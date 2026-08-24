@@ -53,14 +53,18 @@ class AppPreferences(context: Context) {
         set(value) = prefs.edit().putString(KEY_CAMERA_SERIAL, value.trim().uppercase()).apply()
 
     /**
-     * Experimentelle Direktkontrolle (Arch B): Nach dem Sehen einer Insta360-
-     * Kamera zusaetzlich ALS CENTRAL auf deren be80-Service verbinden und
-     * UploadGPS schreiben. Standard AUS - die Original-App macht das zwar,
-     * das Original-GPS-Remote aber NICHT; der Doppelrollen-Betrieb steht in
-     * Verdacht, Kamera-Trennungen (status=19) zu verursachen.
+     * Central-Verbindung zur Kamera (Arch B) als **MTU-Bootstrap**.
+     *
+     * Standard AN - das ist KEINE echte Direktkontrolle mehr: Der Client
+     * verbindet sich nur, fordert requestMtu(517) an und bleibt dann idle.
+     * Empirisch hebt die Kamera daraufhin auf ihrer EIGENEN Verbindung zu
+     * unserem ce80-Server die MTU auf 251 an; ohne diesen Stoss bleiben
+     * GPS-Frames (>20B) auf MTU 23 gestoetten und die Kamera empfängt Muell.
+     *
+     * Ausschalten nur zu Diagnosezwecken (dann fehlen grosse Frames).
      */
     var enableDirectControl: Boolean
-        get() = prefs.getBoolean(KEY_ENABLE_DIRECT_CONTROL, false)
+        get() = prefs.getBoolean(KEY_ENABLE_DIRECT_CONTROL, true)
         set(value) = prefs.edit().putBoolean(KEY_ENABLE_DIRECT_CONTROL, value).apply()
 
     companion object {

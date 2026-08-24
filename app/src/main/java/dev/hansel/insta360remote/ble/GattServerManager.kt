@@ -85,6 +85,9 @@ class GattServerManager(
     /** Aktueller Modus des Streams (fuer Wechsel-Logging). */
     private var lastStreamVoid = true
 
+    /** Rate-Limit fuer die NO_FIX-Erklaerlogs. */
+    private var lastNoFixLogAt = 0L
+
     private var notifyCharRef: BluetoothGattCharacteristic? = null
 
 
@@ -248,6 +251,17 @@ class GattServerManager(
         lastFix = fix
         if (fix.fixQuality != dev.hansel.insta360remote.location.GpsFix.FixQuality.NO_FIX) {
             lastValidFix = fix
+        } else {
+            // Rate-limitiert (max. alle 10 s) erklaeren, WARUM der Stream void laeuft
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (now - lastNoFixLogAt > 10000) {
+                lastNoFixLogAt = now
+                Diagnostics.log(TAG, String.format(java.util.Locale.US,
+                    "Fix mit NO_FIX uebergangen (acc=%.0fm > 50m?) - Status-A-Basis: %s",
+                    fix.horizontalAccuracyMeters,
+                    if (lastValidFix != null) "letzter gueltiger Fix im Hold-Fenster" else
+                        "KEIN gueltiger Fix bisher (raus gehen oder Fake-GPS nutzen!)"))
+            }
         }
         startStreamLoop()
     }
