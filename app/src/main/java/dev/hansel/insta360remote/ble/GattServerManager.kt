@@ -57,6 +57,11 @@ class GattServerManager(
     /** Button-SN gemaess Spec §4: bei jeder neuen Verbindung auf 0 zuruecksetzen. */
     private var buttonSn = 0
 
+    // --- Diagnose-Zaehler des GPS-Stroms (Reset bei jeder neuen Verbindung) ---
+    private var framesSent = 0
+    private var framesVoidSent = 0
+    private var framesRejected = 0
+
     private var pendingServiceAdds = 0
     private var confirmedServiceAdds = 0
 
@@ -246,12 +251,27 @@ class GattServerManager(
         ensurePlaceholderFix()
         if (streamRunning) return
         streamRunning = true
+        framesSent = 0; framesVoidSent = 0; framesRejected = 0
+        Diagnostics.log(TAG, "GPS-Strom gestartet (Intervall=${STREAM_INTERVAL_MS}ms, " +
+            "MTU=$negotiatedMtu -> nutzbar ${negotiatedMtu - ATT_HEADER_SIZE}B/Notify)")
         streamHandler.post { pumpFrame() }
     }
 
     private fun stopStreamLoop() {
+        val wasRunning = streamRunning
         streamRunning = false
         streamHandler.removeCallbacksAndMessages(null)
+        if (wasRunning) {
+            val active = framesSent - framesVoidSent
+            Diagnostics.log(TAG,
+                "GPS-Strom beendet: gesendet=$framesSent (aktiv(A)=$active, void(V)=$framesVoidSent, " +
+                    "abgelehnt=$framesRejected)")
+            if (framesVoidSent > framesSent / 2 && framesSent > 20) {
+                Diagnostics.log(TAG,
+                    "HINWEIS: Mehrheit VOID-Saetze - die App hatte ueberwiegend NO_FIX. " +
+                        "Die Kamera bettet nur Status-A-Saetze ein!")
+            }
+        }
     }
 
     @android.annotation.SuppressLint("MissingPermission")
@@ -269,6 +289,9 @@ class GattServerManager(
 
         val fix = lastFix ?: run { ensurePlaceholderFix(); lastFix!! }
         val frame = encoder.encodeGpsUpdate(fix, 0)
+        val isVoid = fix.fixQuality == dev.hansel.insta360remote.location.GpsFix.FixQuality.NO_FIX
+        framesSent++
+        if (isVoid) framesVoidSent++
 
         // WICHTIG: Ein Frame = EIN Notify (das Original sendet die ~88-90 Bytes
         // als einzelne ATT-Notification). Kein Fragmentieren! Die Kamera handelt
@@ -276,8 +299,17 @@ class GattServerManager(
         if (frame.size > negotiatedMtu - ATT_HEADER_SIZE && !mtuWarned) {
             mtuWarned = true
             Diagnostics.log(TAG,
-                "WARNUNG: Frame (${frame.size}B) > MTU-3 (${negotiatedMtu - ATT_HEADER_SIZE}B) - " +
-                    "Kamera hat noch keine grosse MTU ausgehandelt")
+                "KRITISCH: Frame (${frame.size}B) > MTU-3 (${negotiatedMtu - ATT_HEADER_SIZE}B) - " +
+                    "Android stutzt jedes Notify vermutlich auf ${negotiatedMtu - ATT_HEADER_SIZE}B! " +
+                    "Die Kamera bekommt dann Muell und kann kein GPS embedden.")
+        }
+
+        // Diagnose: 1. Frame + jeden 50. komplett loggen (Typ, Groesse, Hex-Kopf).
+        if (framesSent == 1 || framesSent % 50 == 0) {
+            val head = frame.copyOf(minOf(frame.size, 24))
+            Diagnostics.log(TAG,
+                "GPS-Strom #$framesSent [${if (isVoid) "V" else "A"}] ${frame.size}B MTU=$negotiatedMtu: " +
+                    Diagnostics.hex(head))
         }
 
         var delivered = 0
@@ -289,7 +321,16 @@ class GattServerManager(
                 Diagnostics.log(TAG, "notify fehlgeschlagen: " + e.message)
                 false
             }
-            if (ok) delivered++
+            if (ok) {
+                delivered++
+            } else {
+                framesRejected++
+                if (framesRejected <= 3 || framesRejected % 50 == 0) {
+                    Diagnostics.log(TAG,
+                        "Notify ABGELEHNT (#$framesRejected) an ${device.address} - " +
+                            "Stack nimmt Frame ${frame.size}B bei MTU=$negotiatedMtu nicht an")
+                }
+            }
         }
         ServiceStatus.incrementNotifyCount(delivered.toLong())
 
@@ -325,6 +366,13 @@ class GattServerManager(
         override fun onMtuChanged(device: BluetoothDevice?, mtu: Int) {
             negotiatedMtu = mtu.coerceAtLeast(DEFAULT_MTU)
             Diagnostics.log(TAG, "MTU ausgehandelt: " + negotiatedMtu)
+            if (negotiatedMtu < 91) {
+                Diagnostics.log(TAG,
+                    "WARNUNG: MTU=$negotiatedMtu ist zu klein fuer 88-Byte-GPS-Frames! " +
+                        "Die Kamera hat keine grosse MTU angefragt - Frames werden gestoßen (truncated). " +
+                        "Falls kein GPS embedded wird, ist DIES die Ursache.")
+                mtuWarned = false // Frame-Log soll die Warnung erneut zeigen
+            }
         }
 
         override fun onConnectionStateChange(device: BluetoothDevice?, status: Int, newState: Int) {
