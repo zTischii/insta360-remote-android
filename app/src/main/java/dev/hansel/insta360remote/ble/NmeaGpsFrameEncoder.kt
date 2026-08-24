@@ -113,7 +113,7 @@ class NmeaGpsFrameEncoder : GpsPayloadEncoder {
     }
 
     private fun utcCalendar(epochMillis: Long): Calendar =
-        Calendar.getInstance(TimeZone.getDefault(), Locale.US).apply { timeInMillis = epochMillis }
+        Calendar.getInstance(TimeZone.getTimeZone("UTC"), Locale.US).apply { timeInMillis = epochMillis }
 
     private fun formatUtcTime(cal: Calendar): String =
         String.format(Locale.US, "%02d%02d%02d.%03d",
