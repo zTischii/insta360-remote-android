@@ -43,12 +43,22 @@ class AppPreferences(context: Context) {
         get() = prefs.getLong(KEY_IDLE_INTERVAL, 5000L)
         set(value) = prefs.edit().putLong(KEY_IDLE_INTERVAL, value).apply()
 
+    /**
+     * Serial-Suffix der Kamera (6 ASCII-Zeichen, z.B. "34UQG5" bei "X4 34UQG5").
+     * Wird fuer den ORBIT-Wake-Beacon gebraucht (weckt schlafende Kameras).
+     * Leer = klassisches UUID-Advertising.
+     */
+    var cameraSerial: String
+        get() = prefs.getString(KEY_CAMERA_SERIAL, "") ?: ""
+        set(value) = prefs.edit().putString(KEY_CAMERA_SERIAL, value.trim().uppercase()).apply()
+
     companion object {
         private const val KEY_AUTO_START = "auto_start_on_boot"
         private const val KEY_USE_FUSED = "use_fused_location"
         private const val KEY_LOCATION_PRIORITY = "location_priority"
         private const val KEY_ACTIVE_INTERVAL = "active_interval_ms"
         private const val KEY_IDLE_INTERVAL = "idle_interval_ms"
+        private const val KEY_CAMERA_SERIAL = "camera_serial"
 
         @Volatile private var instance: AppPreferences? = null
 

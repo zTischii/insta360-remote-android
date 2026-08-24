@@ -14,8 +14,11 @@ app/src/main/java/dev/hansel/insta360remote/
 │   ├── Insta360Uuids.kt        # Service-/Charakteristik-UUIDs (be8x/ce8x-Sets umschaltbar)
 │   ├── Insta360Protocol.kt     # Framing: Länge+16-Byte-Cmdblock+Payload, SN ab 0x0200,
 │   │                           #   20-Byte-Fragmentierung, FrameAssembler für Empfang
-│   ├── GpsPayloadEncoder.kt    # AUSTAUSCHBARES Interface + Best-Guess-protobuf-Encoder
-│   └── GattServerManager.kt    # Advertising + GATT-Server, MTU/CCCD, Reconnect
+│   ├── GpsPayloadEncoder.kt    # Interface + historischer Best-Guess-protobuf-Encoder
+│   ├── NmeaGpsFrameEncoder.kt  # VERIFIZIERTES X4-Format: FC EF FE 83 + NMEA-RMC (10Hz),
+│   │                           #   Void-Frames, ORBIT-Wake-Beacon-Builder
+│   └── GattServerManager.kt    # Advertising + GATT-Server, MTU/CCCD, Reconnect,
+│                               #   10-Hz-Liveness-Strom, FE-EF-FE-Frame-Parser
 ├── location/
 │   ├── LocationSource.kt       # Interface + Location->GpsFix-Mapping
 │   ├── FusedLocationSource.kt  # Play Services, PRIORITY_BALANCED_POWER_ACCURACY
@@ -31,38 +34,66 @@ app/src/main/java/dev/hansel/insta360remote/
 └── ui/                         # MainActivity + MainViewModel
 ```
 
-## WICHTIG: Protokoll-Verifikation vor Erstnutzung
+## FORSCHUNGSSTAND: GPS-Protokoll VERIFIZIERT (Stand Aug 2026)
 
-Das GPS-Payload-Format ist in den öffentlichen Reverse-Engineering-Quellen
-**nicht vollständig dokumentiert**. Die App enthält deshalb:
+Das GPS-Payload-Format des Original-GPS-Remotes wurde inzwischen vollstaendig
+reverse-engineert und **on-air gegen eine physische X4 bestaetigt**:
 
-1. **`GpsPayloadEncoder` als Interface** – sobald das echte Format bekannt ist,
-   wird eine zweite Implementierung ergänzt und in `GpsRemoteService.ensureStarted()`
-   ausgetauscht. Keine weiteren Codeänderungen nötig.
-2. **Vollständiges Logging aller GATT-Pakete** (Hex-Dump) im Diagnose-Screen der App.
-3. UUID-Sets `be8x` und `ce8x` sind per `Insta360Uuids.activeSet` umschaltbar.
+**Primärquelle:** [TheAngryRaven/insta360-ble-gps-spec](https://github.com/TheAngryRaven/insta360-ble-gps-spec)
+(Passiv-Sniff mit nRF52840 + Wireshark gegen X4 + Original-Remote, Juli 2026).
+Konsistent mit: `tsunghowu/insta360_ble_rc_rpi_pico_w` (X4-Shutter-Remote),
+`pwchalk/insta360_ble_esp32`, `xaionaro-go/insta360ctl`.
 
-### Setup-Kapitel: Sniffing mit echtem Hardware-Remote
+### Architektur A (ce80/ce81/ce82) - DER verifizierte GPS-Pfad
 
-**Variante A – Android HCI Snoop Log (empfohlen):**
-1. Entwickleroptionen → *Bluetooth HCI snoop log aktivieren*, Bluetooth an/aus.
-2. Original-GPS-Remote mit der Kamera koppeln und eine Aufnahme starten.
-3. Bugreport ziehen: `adb bugreport bugreport.zip`
-4. In `bugreport/FS/data/misc/bluetooth/logs/btsnoop_hci.log` öffnen (Wireshark).
-5. Wireshark-Filter auf den Remote: `btcommon.eir_ad.entry.device_name` bzw. nach dem
-   Service-UUID-Filter: `btatt.handle` → ATT-Write/Notify-Pakete der Verbindung suchen.
+Die ce82-Payload ist **NICHT Protobuf** (die fruehere "0x0A 0x35"-Hypothese war
+falsch). Das Remote streamt ~10 Hz HDLC-aehnliche Frames um **NMEA-RMC-Saetze**:
 
-**Variante B – nRF Connect for Mobile:**
-1. Kamera in den Verbindungsmodus versetzen, in nRF Connect *SCAN*.
-2. Das originale Remote erscheint mit advertised Service-UUID → **UUID-Set notieren**.
-3. Mit *Connect* verbinden (nRF statt Kamera) und die Charakteristiken inspizieren;
-   CCCD des Notify-Charakters aktivieren und die vom Remote gesendeten Frames mitschneiden.
+```
+FC EF FE 83 00 <LEN> ",26.7," <0x07> "," $GNRMC,...*CS
+└─ Header (6) ───────┘ └─ Prefix (8) ──┘   └─ NMEA ─────┘
+```
 
-**Was zu verifizieren ist:**
-- [ ] UUID-Set (`be80/be81/be82/be83` vs. `ce80/…`) → `Insta360Uuids.activeSet`
-- [ ] Layout des 16-Byte-Kommandoblocks (SN-Position, Command-ID, Payload-Länge)
-- [ ] Exaktes GPS-Payload-Format (protobuf-Feldnummern/-typen oder Rohformat)
-- [ ] Notify-Intervall des originalen Remotes (Default hier: 1 Hz)
+- Prefix `,26.7,\x07,`: konstant in allen Captures ("26.7" vermutlich
+  Temperatur, `\x07` vermutlich Satellite-Count) - exakt uebernehmen.
+- RMC-Besonderheiten: Laengengrad **vorzeichenbehaftet** mit immer 'E'
+  (74°W -> `-7400.0000,E`); zusaetzliches `V` zwischen Mode und Checksumme;
+  Koordinaten als `ddmm.mmmm`; Talker-ID `GN`.
+- Checksumme: XOR aller Zeichen zwischen `$` und `*`, zwei Hex-Digits.
+- Beispiel: `$GNRMC,120000.000,A,4000.0000,N,-7400.0000,E,0.00,0.00,010126,0.0,W,A,V*6E`
+- **Liveness**: Strom darf nie verstummen; ohne Fix Void-Saetze (`...V,...N,V`)
+  senden, sonst gilt das Remote als verschwunden (~30 s Idle-Drop).
+- ce81 (Kamera->Remote): `FE EF FE <TYP> <B4> <LEN> <PAYLOAD>` - Typen:
+  0x07 Serial-Handshake, 0x10 Display-String (Mode/Battery/**Rec-Timer**),
+  0x02 Statuswort, 0x05 Ack. Der frueher gedeutete "SYNC-Befehl 0x06" war ein
+  Parse-Fehler (LEN-Byte des Handshakes).
+- Wake-Beacon: gefälschter Apple-iBeacon (`4C 00 02 15` + ASCII `ORBIT` +
+  6-Byte-Kamera-Serial), weckt schlafende Kameras. Optional via
+  `AppPreferences.cameraSerial` aktiviert.
+- Button-Frames: `FC EF FE 86 <SN> 03 01 <BTN> <STATE>`, SN += 2 je Event,
+  Reset auf 0 bei jeder neuen Verbindung.
+
+Implementierung: `NmeaGpsFrameEncoder` + `GattServerManager` (10-Hz-Strom,
+Void-Frames, Frame-Parser, ORBIT-Advertising).
+
+### Architektur B (be80/be81/be82) - experimentell
+
+- Header16-Format der X-Serie benoetigt laut `xaionaro-go/insta360ctl` KEINEN
+  Sync/Autorisierungs-Handshake (Sync + CheckAuthorization sind GO 2/GO 3-
+  spezifisch im FF-Frame-Format).
+- Cmd 0x35 UPLOAD_GPS ist nur fuer **GO 3** als funktionierend dokumentiert;
+  fuer X3/X4/X5 gibt es keinen oeffentlichen Erfolgsbeleg, dass GPS hierueber
+  in .insv eingebettet wird.
+- `status=0` im Write-Callback bedeutet nur Link-Layer-OK (bei
+  WRITE_TYPE_NO_RESPONSE gibt es keine Applikations-Antwort).
+- Wir senden 0x35 weiterhin als Experiment (schadet nicht), verlassen uns aber
+  auf Architektur A.
+
+### Verbleibende offene Punkte
+
+- [ ] MTU: Kamera muss als Central gross genug aushandeln (Original-Remote
+      sendet ~88-90-Byte-Notifies). Log-Warnung vorhanden, falls MTU zu klein.
+- [ ] Bedeutung von Prefix-Feldern ("26.7", 0x07) - Konstanten aus Captures.
 
 ## Build & Installation
 
@@ -81,8 +112,9 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 
 ## Bekannte Einschränkungen
 
-- Das GPS-Payload-Format im `BestGuessGpsPayloadEncoder` ist **unverifiziert**
-  und muss nach Sniffing korrigiert werden, bis die Kamera die Daten akzeptiert.
+- Architektur A ist auf das **verifizierte X4-Format** umgestellt
+  (`NmeaGpsFrameEncoder`, 10 Hz NMEA-RMC). Der alte `BestGuessGpsPayloadEncoder`
+  bleibt als Referenz im Code.
 - Connection-Parameter-Requests kann ein Peripheral unter Android nicht aktiv
   senden; die Kamera diktiert das Intervall. Wir antworten nur auf MTU-Verhandlung.
 - OEM-Deep-Links sind Best-Effort (nicht offiziell dokumentiert), immer mit

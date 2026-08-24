@@ -94,10 +94,11 @@ object CameraScanner {
                 Diagnostics.log(TAG, ">>> KAMERA GEFUNDEN: name=$name addr=${result.device.address} rssi=${result.rssi}")
                 Diagnostics.log(TAG, "    uuids=$uuids")
                 Diagnostics.log(TAG, "    advBytes=${Diagnostics.hex(result.scanRecord?.bytes)}")
-                // Architektur B (gemaess xaionaro-go/insta360ctl): Wir verbinden
-                // uns als Central zum BE80-Server der Kamera und injizieren GPS
-                // per Cmd 0x35 UploadGPS - das ist der Weg fuer Geotagging.
-                CameraClient.connect(context, result.device)
+                if (result.device.address.startsWith("B8:2D")) { // X4 MAC prefix (oder Name checken)
+                    Diagnostics.log(TAG, "Kamera gefunden! Verbinde als Central...")
+                    stop() // <- GANZ WICHTIG: Scanner stoppen, sobald Kamera gefunden
+                    dev.hansel.insta360remote.ble.CameraClient.connect(context, result.device)
+                }
             }
         }
     }

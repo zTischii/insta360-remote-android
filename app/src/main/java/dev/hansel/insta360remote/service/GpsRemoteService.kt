@@ -14,9 +14,9 @@ import androidx.lifecycle.LifecycleService
 import androidx.lifecycle.lifecycleScope
 import dev.hansel.insta360remote.MainActivity
 import dev.hansel.insta360remote.R
-import dev.hansel.insta360remote.ble.BestGuessGpsPayloadEncoder
 import dev.hansel.insta360remote.ble.CameraClient
 import dev.hansel.insta360remote.ble.GattServerManager
+import dev.hansel.insta360remote.ble.NmeaGpsFrameEncoder
 import dev.hansel.insta360remote.core.AppPreferences
 import dev.hansel.insta360remote.core.BleConnectionState
 import dev.hansel.insta360remote.core.Diagnostics
@@ -68,7 +68,8 @@ class GpsRemoteService : LifecycleService() {
 
         gattServerManager = GattServerManager(
             context = this,
-            encoder = BestGuessGpsPayloadEncoder(), // austauschbar nach Protokoll-Verifikation
+            // VERIFIZIERTES X4-Format (NMEA-RMC in FC-EF-FE-83-Frames, 10 Hz):
+            encoder = NmeaGpsFrameEncoder(),
         )
         if (!gattServerManager!!.start()) {
             Diagnostics.log(TAG, "BLE-Start fehlgeschlagen (Permissions?)")
@@ -81,10 +82,14 @@ class GpsRemoteService : LifecycleService() {
             try {
                 locationController!!.fixes(lifecycleScope).collect { fix ->
                     ServiceStatus.setLastFix(fix)
-                    // Weg A: Peripheral-Notify (falls Kamera uns verbunden hat).
+                    // Weg A (PRIMAER, X4-verifiziert): 10-Hz-NMEA-Strom auf ce82
+                    // (FC EF FE 83 + $GNRMC) - genau wie das Original-GPS-Remote.
                     gattServerManager?.broadcastFix(fix)
-                    // Weg B: Central-GPS-Injection (Cmd 0x35 UploadGPS, falls
-                    // wir mit dem be80-Server der Kamera verbunden sind).
+                    // Weg B (EXPERIMENTELL): Header16-Cmd 0x35 UploadGPS auf be81.
+                    // Kein oeffentlicher Beleg, dass die X-Serie GPS hierueber in
+                    // .insv einbettet; status=0 im Write-Callback bedeutet nur
+                    // "Link-Layer-OK", nicht "Semantik akzeptiert". Schadet nicht,
+                    // hilft evtl. bei anderen Modellen (GO 3 verifiziert).
                     CameraClient.sendGpsFix(fix)
                 }
             } catch (e: Exception) {

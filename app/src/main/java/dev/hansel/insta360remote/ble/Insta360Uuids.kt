@@ -54,15 +54,18 @@ object Insta360Uuids {
     val SECONDARY_SERVICE_UUID: UUID =
         UUID.fromString("0000D0FF-3C17-D293-8E48-14FE2E4DA212")
 
-    val SEC_FFD1_WRITE: UUID = uuid("ffd1")
-    val SEC_FFD2_READ: UUID = uuid("ffd2")
-    val SEC_FFD3_READ: UUID = uuid("ffd3")
-    val SEC_FFD4_READ: UUID = uuid("ffd4")
-    val SEC_FFD5_READ: UUID = uuid("ffd5")
-    val SEC_FFD8_WRITE: UUID = uuid("ffd8")
-    val SEC_FFF1_READ: UUID = uuid("fff1")
-    val SEC_FFF2_WRITE: UUID = uuid("fff2")
-    val SEC_FFE0_READ: UUID = uuid("ffe0")
+    private fun secUuid(shortHex: String): UUID =
+        UUID.fromString(String.format(java.util.Locale.US, "0000%s-3c17-d293-8e48-14fe2e4da212", shortHex))
+
+    val SEC_FFD1_WRITE: UUID = secUuid("ffd1")
+    val SEC_FFD2_READ: UUID = secUuid("ffd2")
+    val SEC_FFD3_READ: UUID = secUuid("ffd3")
+    val SEC_FFD4_READ: UUID = secUuid("ffd4")
+    val SEC_FFD5_READ: UUID = secUuid("ffd5")
+    val SEC_FFD8_WRITE: UUID = secUuid("ffd8")
+    val SEC_FFF1_READ: UUID = secUuid("fff1")
+    val SEC_FFF2_WRITE: UUID = secUuid("fff2")
+    val SEC_FFE0_READ: UUID = secUuid("ffe0")
 
     val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 

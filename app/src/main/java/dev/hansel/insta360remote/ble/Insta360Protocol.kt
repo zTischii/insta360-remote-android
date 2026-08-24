@@ -24,7 +24,7 @@ object Insta360Protocol {
     const val INITIAL_SN = 0x0200
 
     // --- Command-IDs (UNVERIFIZIERT - aus ESP32-Projekt-Sniffs abgeleitet) ---
-    const val CMD_GPS_DATA = 0x10        // Remote -> Kamera: GPS-Update
+    const val CMD_GPS_DATA = 0x35        // Remote -> Kamera: GPS-Update (CodeUploadGPS)
     const val CMD_BUTTON_EVENT = 0x15    // Remote -> Kamera: Shutter/Modus-Taste
     const val CMD_STATUS_ACK = 0x01      // generisches Ack
 

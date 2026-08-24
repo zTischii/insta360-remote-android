@@ -70,45 +70,57 @@ object MiniProtoWriter {
 }
 
 /**
- * BEST-GUESS-Implementierung des GPS-Payloads.
+ * Raw-Binary-GPS-Encoder (HISTORISCH / UNGUELTIG).
  *
- * Annahme (UNVERIFIZIERT!): Die Kamera erwartet die GPS-Daten als protobuf-
- * kodierte Nachricht hinter dem Kommandoblock, aehnlich den bekannten
- * Kommando-Nachrichten. Diese Implementierung nutzt:
+ * Dies war ein Best-Guess auf Basis eines fehlinterpretierten Sniffs und hat
+ * sich als FALSCH herausgestellt: Die Kamera erwartet auf ce82 kein
+ * Laengenbyte+Kommandoblock+Protobuf, sondern FC-EF-FE-83-Frames mit
+ * NMEA-RMC-Saetzen ([NmeaGpsFrameEncoder]). Diese Klasse bleibt nur als
+ * Dokumentation des Irrwegs im Code.
  *
- *   Field 1: latitude          (double)
- *   Field 2: longitude         (double)
- *   Field 3: altitude          (double)
- *   Field 4: speed             (float)
- *   Field 5: timestamp UTC ms  (uint64)
- *   Field 6: fix quality       (uint32)
- *
- * VERIFIKATIONSPFAD: Mit einem originalen GPS-Remote + HCI-Snoop-Log
- * (Developer Options -> Bluetooth HCI snoop log) bzw. nRF Connect die Notify-
- * Pakete mitschneiden, gegen diese Struktur vergleichen und anschliessend
- * entweder die Feldnummern/-typen hier korrigieren oder eine neue
- * GpsPayloadEncoder-Implementierung registrieren.
+ * Der Kommandoblock verwendet CMD_GPS_DATA (0x35).
  */
 class BestGuessGpsPayloadEncoder : GpsPayloadEncoder {
 
     override fun encodeGpsUpdate(fix: GpsFix, sn: Int): ByteArray {
-        val payload = ArrayList<Byte>(64)
-        with(MiniProtoWriter) {
-            doubleField(payload, 1, fix.latitude)
-            doubleField(payload, 2, fix.longitude)
-            doubleField(payload, 3, fix.altitudeMeters)
-            floatField(payload, 4, fix.speedMps)
-            varintField(payload, 5, fix.utcEpochMillis)
-            varintField(payload, 6, fix.fixQuality.ordinal.toLong())
-        }
+        // Payload: 8+8+8 + 8 + 4 + 4 + 1 + 1 = 42 bytes
+        val payload = ByteArray(42)
+        putF64(payload,  0, fix.latitude)
+        putF64(payload,  8, fix.longitude)
+        putF64(payload, 16, fix.altitudeMeters)
+        putI64(payload, 24, fix.utcEpochMillis)
+        putF32(payload, 32, fix.speedMps)
+        putF32(payload, 36, fix.bearingDeg)
+        payload[40] = when (fix.fixQuality) {
+            GpsFix.FixQuality.GPS_FIX      -> 1
+            GpsFix.FixQuality.DIFFERENTIAL -> 2
+            GpsFix.FixQuality.RTK          -> 4
+            else                           -> 0
+        }.toByte()
+        payload[41] = fix.satelliteCount.coerceIn(0, 255).toByte()
+
         val block = Insta360Protocol.buildCommandBlock(
             sn = sn,
             commandId = Insta360Protocol.CMD_GPS_DATA,
             payloadLength = payload.size
         )
-        val frame = Insta360Protocol.frame(block, MiniProtoWriter.toByteArray(payload))
-        Diagnostics.log(TAG, "GPS frame (sn=$sn): ${Diagnostics.hex(frame)}")
+        val frame = Insta360Protocol.frame(block, payload)
+        Diagnostics.log(TAG, "GPS frame (sn=$sn lat=${fix.latitude} lon=${fix.longitude} qual=${fix.fixQuality}): ${Diagnostics.hex(frame)}")
         return frame
+    }
+
+    private fun putF64(dst: ByteArray, off: Int, v: Double) {
+        val bits = java.lang.Double.doubleToRawLongBits(v)
+        for (i in 0 until 8) dst[off + i] = ((bits ushr (8 * i)) and 0xFF).toByte()
+    }
+
+    private fun putI64(dst: ByteArray, off: Int, v: Long) {
+        for (i in 0 until 8) dst[off + i] = ((v ushr (8 * i)) and 0xFF).toByte()
+    }
+
+    private fun putF32(dst: ByteArray, off: Int, v: Float) {
+        val bits = java.lang.Float.floatToRawIntBits(v)
+        for (i in 0 until 4) dst[off + i] = ((bits ushr (8 * i)) and 0xFF).toByte()
     }
 
     companion object {

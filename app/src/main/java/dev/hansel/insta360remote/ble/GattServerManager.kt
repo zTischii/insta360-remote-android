@@ -1,4 +1,4 @@
-﻿package dev.hansel.insta360remote.ble
+package dev.hansel.insta360remote.ble
 
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothGatt
@@ -13,18 +13,25 @@ import android.bluetooth.le.AdvertiseData
 import android.bluetooth.le.AdvertiseSettings
 import android.bluetooth.le.BluetoothLeAdvertiser
 import android.content.Context
+import dev.hansel.insta360remote.core.AppPreferences
 import dev.hansel.insta360remote.core.BleConnectionState
 import dev.hansel.insta360remote.core.Diagnostics
 import dev.hansel.insta360remote.core.ServiceStatus
 
 /**
- * BLE-Peripheral-Rolle: Advertising + GATT-Server.
+ * BLE-Peripheral-Rolle: Advertising + GATT-Server (Architektur A - GPS-Remote).
  *
- * Live-Erkenntnisse X4: Der OEM-Stack stellt onServiceAdded/
+ * VERIFIZIERTES X4-Protokoll (TheAngryRaven/insta360-ble-gps-spec, nRF52840-Sniff):
+ *  - ce82: 10-Hz-GPS-Strom als FC-EF-FE-83-Frames mit NMEA-RMC (NmeaGpsFrameEncoder),
+ *    ununterbrochen inkl. Void-Frames ohne Fix (Liveness, sonst Idle-Drop ~30 s).
+ *  - ce81: Kamera schreibt FE-EF-FE-Frames (Serial-Handshake 0x07, Status 0x02/0x05,
+ *    Display-String 0x10). Write-Response ist das Ack.
+ *  - CCCD-Subscription: Button-SN auf 0, Strom sofort starten.
+ *
+ * Live-Erkenntnisse X4/Android: Der OEM-Stack stellt onServiceAdded/
  * onDescriptorWriteRequest teils NICHT an die App zu. Daher eigene
  * Characteristic-Referenzen, Advertising per Timeout-Fallback und Broadcasts
- * an ALLE verbundenen Geraete. Die Kamera trennt nach ca. 30s ohne
- * Datenstrom -> letzten Fix alle 2s wiederholen.
+ * an ALLE verbundenen Geraete.
  */
 class GattServerManager(
     private val context: Context,
@@ -41,17 +48,20 @@ class GattServerManager(
     private val clients = LinkedHashSet<BluetoothDevice>()
 
     private var negotiatedMtu = DEFAULT_MTU
-    private val snCounter = Insta360Protocol.SequenceCounter()
-    private val assembler = Insta360Protocol.FrameAssembler()
+    private var mtuWarned = false
+
+    /** 10-Hz-Liveness-Strom gem. X4-Spec (§5): 100 ms Takt. */
+    private val streamHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var streamRunning = false
+
+    /** Button-SN gemaess Spec §4: bei jeder neuen Verbindung auf 0 zuruecksetzen. */
+    private var buttonSn = 0
 
     private var pendingServiceAdds = 0
     private var confirmedServiceAdds = 0
 
     @Volatile
     private var lastFix: dev.hansel.insta360remote.location.GpsFix? = null
-
-    private val resendHandler = android.os.Handler(android.os.Looper.getMainLooper())
-    private var resendRunning = false
 
     private var notifyCharRef: BluetoothGattCharacteristic? = null
 
@@ -86,9 +96,7 @@ class GattServerManager(
             val primaryService = Insta360Uuids.buildService()
             notifyCharRef = primaryService.getCharacteristic(Insta360Uuids.CHAR_NOTIFY_UUID)
             server.addService(primaryService)
-            server.addService(Insta360Uuids.buildSecondaryService())
-            Diagnostics.log(TAG, "addService() fuer beide Services abgeschickt")
-
+            Diagnostics.log(TAG, "addService() fuer Primaer-Service abgeschickt")
             // Fallback fuer Stacks ohne onServiceAdded-Dispatch.
             android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
                 if (gattServer != null && !advertising &&
@@ -116,11 +124,10 @@ class GattServerManager(
         try { advertiser?.stopAdvertising(advertiseCallback) } catch (_: Exception) {}
         advertising = false
         CameraScanner.stop()
-        stopResendLoop()
+        stopStreamLoop()
         try { gattServer?.close() } catch (_: Exception) {}
         gattServer = null
         synchronized(clients) { clients.clear() }
-        assembler.reset()
         ServiceStatus.setBleState(BleConnectionState.Idle)
         Diagnostics.log(TAG, "GattServerManager gestoppt")
     }
@@ -129,6 +136,11 @@ class GattServerManager(
         androidx.core.content.ContextCompat.checkSelfPermission(
             context, android.Manifest.permission.BLUETOOTH_CONNECT
         ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+
+    /** Serial fuer den ORBIT-Wake-Beacon (leer = klassisches UUID-Advertising). */
+    private fun cameraSerialOrNull(): String? =
+        try { AppPreferences.get(context).cameraSerial.trim().uppercase().ifEmpty { null } }
+        catch (_: Exception) { null }
 
     // ------------------------------------------------------------ Advertising
 
@@ -151,8 +163,7 @@ class GattServerManager(
             Diagnostics.log(TAG, "Konnte Bluetooth-Namen nicht setzen: " + e.message)
         }
 
-        // EXAKT wie die ESP32-Referenz (Chwalek): beide Service-UUIDs inkl.
-        // TX-Power im Adv-Paket, Name im Scan-Response.
+        // AdvertiseSettings wie gehabt; das Adv-Payload haengt vom Modus ab (s.u.).
         val settings = AdvertiseSettings.Builder()
             .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_BALANCED)
             .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_MEDIUM)
@@ -160,12 +171,32 @@ class GattServerManager(
             .setTimeout(0)
             .build()
 
-        val advertiseData = AdvertiseData.Builder()
-            .setIncludeDeviceName(false)
-            .setIncludeTxPowerLevel(true)
-            .addServiceUuid(Insta360Uuids.SERVICE_PARCEL_UUID)
-            .addServiceUuid(Insta360Uuids.SECONDARY_SERVICE_PARCEL_UUID)
-            .build()
+        // Zwei Modi:
+        //  a) ORBIT-Wake-Beacon (X4-Spec §1): exakter Klon der Original-Remote-
+        //     Advertisement inkl. Kamera-Serial -> weckt schlafende Kameras.
+        //     Flags + Manufacturer-Data fuellen exakt die 31 Legacy-Bytes,
+        //     daher KEINE Service-UUIDs/TX-Power ins Adv-Paket.
+        //  b) Klassisch (Default ohne konfigurierte Serial): beide Service-UUIDs
+        //     + TX-Power, Name im Scan-Response (ESP32-Referenzmuster).
+        val serial = cameraSerialOrNull()
+        val orbitData = NmeaGpsFrameEncoder.buildOrbitManufacturerData(serial)
+
+        val advertiseData = if (orbitData != null) {
+            Diagnostics.log(TAG, "Advertising-Modus: ORBIT-Wake-Beacon (Serial=$serial) " +
+                "hex=" + NmeaGpsFrameEncoder.debugWakeBeaconHex(serial!!))
+            AdvertiseData.Builder()
+                .setIncludeDeviceName(false)
+                .setIncludeTxPowerLevel(false)
+                .addManufacturerData(0x004C, orbitData) // Apple Company-ID wie Original
+                .build()
+        } else {
+            AdvertiseData.Builder()
+                .setIncludeDeviceName(false)
+                .setIncludeTxPowerLevel(true)
+                .addServiceUuid(Insta360Uuids.SERVICE_PARCEL_UUID)
+                .addServiceUuid(Insta360Uuids.SECONDARY_SERVICE_PARCEL_UUID)
+                .build()
+        }
 
         val scanResponse = AdvertiseData.Builder()
             .setIncludeDeviceName(true)
@@ -184,59 +215,85 @@ class GattServerManager(
 
     // ------------------------------------------------------------ GPS-Sendung
 
+    /**
+     * Neuesten Fix uebernehmen. Gesendet wird nicht hier, sondern vom
+     * 10-Hz-Stream ([startStreamLoop]) - so wie beim Original-Remote.
+     */
     fun broadcastFix(fix: dev.hansel.insta360remote.location.GpsFix) {
         lastFix = fix
+        startStreamLoop()
+    }
+
+    private fun ensurePlaceholderFix() {
+        if (lastFix == null) {
+            lastFix = dev.hansel.insta360remote.location.GpsFix(
+                latitude = 0.0, longitude = 0.0, altitudeMeters = 0.0,
+                speedMps = 0f, bearingDeg = 0f, horizontalAccuracyMeters = 0f,
+                utcEpochMillis = System.currentTimeMillis(),
+                satelliteCount = 0,
+                fixQuality = dev.hansel.insta360remote.location.GpsFix.FixQuality.NO_FIX
+            )
+        }
+    }
+
+    /**
+     * Liveness-Strom gem. X4-Spec §5/§7: ~10 Hz (100 ms), ununterbrochen solange
+     * ein Client abonniert hat. Ohne echten Fix werden RMC-Voidsaetze (Status 'V')
+     * gesendet - die Kamera darf den Strom nie verstummen lassen, sonst behandelt
+     * sie das Remote als verschwunden (beobachteter Idle-Drop nach ~30 s).
+     */
+    private fun startStreamLoop() {
+        ensurePlaceholderFix()
+        if (streamRunning) return
+        streamRunning = true
+        streamHandler.post { pumpFrame() }
+    }
+
+    private fun stopStreamLoop() {
+        streamRunning = false
+        streamHandler.removeCallbacksAndMessages(null)
+    }
+
+    @android.annotation.SuppressLint("MissingPermission")
+    private fun pumpFrame() {
+        if (!streamRunning) return
         val characteristic = notifyCharRef ?: run {
-            Diagnostics.log(TAG, "Notify-Charakteristik nicht bereit - Fix verworfen")
+            streamRunning = false
             return
         }
-        // An ALLE verbundenen Geraete senden - der Stack liefert Notify nur an
-        // tatsaechlich Abonnierte (CCCD-Verwaltung liegt im Stack).
         val targets = synchronized(clients) { clients.toList() }
-        if (targets.isEmpty()) return
+        if (targets.isEmpty()) {
+            streamRunning = false
+            return
+        }
 
-        val frame = encoder.encodeGpsUpdate(fix, snCounter.next())
-        val chunks = Insta360Protocol.fragment(frame, negotiatedMtu - ATT_HEADER_SIZE)
+        val fix = lastFix ?: run { ensurePlaceholderFix(); lastFix!! }
+        val frame = encoder.encodeGpsUpdate(fix, 0)
+
+        // WICHTIG: Ein Frame = EIN Notify (das Original sendet die ~88-90 Bytes
+        // als einzelne ATT-Notification). Kein Fragmentieren! Die Kamera handelt
+        // als Central eine ausreichende MTU aus (onMtuChanged meldet sie uns).
+        if (frame.size > negotiatedMtu - ATT_HEADER_SIZE && !mtuWarned) {
+            mtuWarned = true
+            Diagnostics.log(TAG,
+                "WARNUNG: Frame (${frame.size}B) > MTU-3 (${negotiatedMtu - ATT_HEADER_SIZE}B) - " +
+                    "Kamera hat noch keine grosse MTU ausgehandelt")
+        }
 
         var delivered = 0
         for (device in targets) {
-            for (chunk in chunks) {
-                characteristic.value = chunk
-                val ok = try {
-                    gattServer?.notifyCharacteristicChanged(device, characteristic, false) ?: false
-                } catch (e: Exception) {
-                    Diagnostics.log(TAG, "notify fehlgeschlagen: " + e.message)
-                    false
-                }
-                if (ok) delivered++
+            characteristic.value = frame
+            val ok = try {
+                gattServer?.notifyCharacteristicChanged(device, characteristic, false) ?: false
+            } catch (e: Exception) {
+                Diagnostics.log(TAG, "notify fehlgeschlagen: " + e.message)
+                false
             }
+            if (ok) delivered++
         }
         ServiceStatus.incrementNotifyCount(delivered.toLong())
 
-        startResendLoop()
-    }
-
-    /** Letzten Fix alle 2s wiederholen - verhindert den 30s-Idle-Drop. */
-    private fun startResendLoop() {
-        if (resendRunning) return
-        resendRunning = true
-        resendHandler.postDelayed(object : Runnable {
-            override fun run() {
-                val fix = lastFix
-                val hasClients = synchronized(clients) { clients.isNotEmpty() }
-                if (fix == null || !hasClients) {
-                    resendRunning = false
-                    return
-                }
-                broadcastFix(fix)
-                resendHandler.postDelayed(this, 2000)
-            }
-        }, 2000)
-    }
-
-    private fun stopResendLoop() {
-        resendRunning = false
-        resendHandler.removeCallbacksAndMessages(null)
+        streamHandler.postDelayed({ pumpFrame() }, STREAM_INTERVAL_MS)
     }
 
     // ------------------------------------------------------------ GATT-Callbacks
@@ -248,12 +305,20 @@ class GattServerManager(
             Diagnostics.log(TAG, "onServiceAdded status=" + status + " uuid=" + (service?.uuid))
             if (status == BluetoothGatt.GATT_SUCCESS && service?.uuid != null) {
                 confirmedServiceAdds++
-                if (confirmedServiceAdds >= pendingServiceAdds && pendingServiceAdds > 0) {
-                    Diagnostics.log(TAG, "Alle Services registriert - starte Advertising")
+                
+                // Sequentielles Hinzufuegen der Services:
+                if (confirmedServiceAdds == 1) {
+                    // Der erste (Primaer-)Service wurde hinzugefuegt, jetzt den zweiten (Sekundaer-)Service starten!
+                    Diagnostics.log(TAG, "Primaer-Service OK. Sende addService() fuer Sekundaer-Service...")
+                    gattServer?.addService(Insta360Uuids.buildSecondaryService())
+                } else if (confirmedServiceAdds == pendingServiceAdds && !advertising) {
+                    // Beide Services sind jetzt erfolgreich registriert. Wir koennen Advertising starten!
                     startAdvertising()
                     CameraScanner.start(context)
                     ServiceStatus.setBleState(BleConnectionState.Advertising)
                 }
+            } else {
+                Diagnostics.log(TAG, "addService fehlgeschlagen (status=$status)")
             }
         }
 
@@ -272,25 +337,41 @@ class GattServerManager(
                         BleConnectionState.Connected(device.name, address)
                     )
                     Diagnostics.log(TAG, "Kamera verbunden: " + address)
+                    startAdvertising()
 
-                    if (lastFix == null) {
-                        lastFix = dev.hansel.insta360remote.location.GpsFix(
-                            latitude = 0.0, longitude = 0.0, altitudeMeters = 0.0,
-                            speedMps = 0f, bearingDeg = 0f, horizontalAccuracyMeters = 0f,
-                            utcEpochMillis = System.currentTimeMillis(),
-                            satelliteCount = 0,
-                            fixQuality = dev.hansel.insta360remote.location.GpsFix.FixQuality.NO_FIX
-                        )
-                        Diagnostics.log(TAG, "Platzhalter-Fix gesetzt (kein GPS-Fix bisher)")
+                    // Liveness-Strom starten - sendet bis zum ersten echten Fix
+                    // automatisch Void-Frames (Spec §7.6).
+                    startStreamLoop()
+                    
+                    // GANZ WICHTIG: Wenn die Kamera sich bei uns meldet, verbinden wir uns
+                    // direkt auch als Central mit ihr, um das GPS (Architecture B) zu senden
+                    // und den Keepalive aufrecht zu erhalten!
+                    // Wir prüfen ob es wirklich eine Insta360 ist (MAC-Prefix oder Name),
+                    // damit wir uns NICHT mit zufälligen BLE-Geräten (z.B. COROS-Watch) verbinden.
+                    val isInsta360 = address.startsWith("B8:2D", ignoreCase = true) ||
+                        address.startsWith("48:B6", ignoreCase = true) ||
+                        device.name?.contains("insta", ignoreCase = true) == true ||
+                        device.name?.contains("X2", ignoreCase = true) == true ||
+                        device.name?.contains("X3", ignoreCase = true) == true ||
+                        device.name?.contains("X4", ignoreCase = true) == true ||
+                        device.name?.contains("X5", ignoreCase = true) == true ||
+                        device.name?.contains("ONE", ignoreCase = true) == true
+                    if (isInsta360) {
+                        Diagnostics.log(TAG, "Insta360-Kamera erkannt ($address) - verbinde als Central in 5s")
+                        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                            dev.hansel.insta360remote.ble.CameraClient.connect(context, device)
+                        }, 5000)
+                    } else {
+                        Diagnostics.log(TAG, "Fremdes Gerät ignoriert (kein Insta360): $address name=${device.name}")
                     }
-                    startResendLoop()
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
                     synchronized(clients) { clients.remove(device) }
-                    assembler.reset()
+                    mtuWarned = false
+                    buttonSn = 0
                     val stillConnected = synchronized(clients) { clients.isNotEmpty() }
                     if (!stillConnected) {
-                        stopResendLoop()
+                        stopStreamLoop()
                         ServiceStatus.setBleState(BleConnectionState.Advertising)
                         Diagnostics.log(TAG, "Kamera getrennt (status=" + status + ") - warte auf Reconnect")
                         restartAdvertisingIfStopped()
@@ -338,6 +419,10 @@ class GattServerManager(
                 val enable = (value[0].toInt() and 0x01) != 0
                 if (enable) {
                     Diagnostics.log(TAG, "Kamera hat Notifies aktiviert (" + device.address + ")")
+                    // Spec §7.4: Bei CCCD-Subscription Button-SN auf 0 zuruecksetzen
+                    // und den 10-Hz-GPS-Strom sofort anlaufen lassen.
+                    buttonSn = 0
+                    startStreamLoop()
                 } else {
                     Diagnostics.log(TAG, "Kamera hat Notifies deaktiviert (" + device.address + ")")
                 }
@@ -355,8 +440,18 @@ class GattServerManager(
             characteristic: BluetoothGattCharacteristic?,
         ) {
             if (device == null || characteristic == null) return
-            // KRITISCH: Read-Requests MUESSEN beantwortet werden.
-            val value = characteristic.value ?: ByteArray(0)
+            
+            // Auf einigen Android-Versionen ist characteristic.value im Callback leer (wird vom OS neu instanziiert).
+            // Daher liefern wir die statischen Werte basierend auf der UUID manuell aus!
+            val value = when (characteristic.uuid) {
+                Insta360Uuids.CHAR_EXTRA_UUID -> byteArrayOf(0x01, 0x02) // 0x0201
+                Insta360Uuids.SEC_FFD3_READ -> byteArrayOf(0x01, 0x90.toByte(), 0x1e, 0x30)
+                Insta360Uuids.SEC_FFD4_READ -> byteArrayOf(0x01, 0x20, 0x00, 0x18)
+                Insta360Uuids.SEC_FFD2_READ, Insta360Uuids.SEC_FFD5_READ, 
+                Insta360Uuids.SEC_FFF1_READ, Insta360Uuids.SEC_FFE0_READ -> byteArrayOf(0x00)
+                else -> characteristic.value ?: ByteArray(0)
+            }
+            
             val response = if (offset < value.size) value.copyOfRange(offset, value.size) else ByteArray(0)
             try {
                 gattServer?.sendResponse(
@@ -395,13 +490,50 @@ class GattServerManager(
         }
     }
 
+    /**
+     * Frame-Parser fuer ce81 (Kamera -> Remote), Format gemaess X4-Spec §3/§6:
+     *
+     * ```
+     * FE EF FE  <TYPE>  <B4>  <LEN>  <PAYLOAD:LEN>
+     * ```
+     *
+     * Beobachtete Typen: 0x07 Serial-Handshake (bei Connect + periodisch),
+     * 0x10 Display-String (Mode/Battery/Aufnahme-Timer, ~1 Hz), 0x02 Statuswort,
+     * 0x05 Status/Ack, 0x0e/0x0f selten.
+     *
+     * HISTORISCHER HINWEIS: Der fruehere "SYNC-Befehl 0x06" war ein Parse-Fehler -
+     * es ist der Serial-Handshake (Typ 0x07, LEN=0x06 bei 6-stelliger Serial).
+     * Die App antwortete darauf mit einem sofortigen GPS-Notify; das Verhalten
+     * ("erste GPS-Daten direkt nach dem Handshake") ist korrekt und wird hier
+     * beibehalten, indem der 10-Hz-Strom beim ersten ce81-Frame angestossen wird.
+     */
     private fun handleCameraFrame(device: BluetoothDevice, chunk: ByteArray) {
-        for (frame in assembler.feed(chunk)) {
-            val commandId = if (frame.size >= 6) frame[5].toInt() and 0xFF else -1
-            Diagnostics.log(
-                TAG,
-                "Frame von Kamera (" + device.address + ", cmd=0x%02X): %s".format(commandId, Diagnostics.hex(frame))
-            )
+        val hasMagic = chunk.size >= 6 &&
+            chunk[0] == 0xFE.toByte() && chunk[1] == 0xEF.toByte() && chunk[2] == 0xFE.toByte()
+        if (!hasMagic) {
+            Diagnostics.log(TAG, "ce81 ohne Magic (" + device.address + "): " + Diagnostics.hex(chunk))
+            return
+        }
+
+        val type = chunk[3].toInt() and 0xFF
+        val len = chunk[5].toInt() and 0xFF
+
+        when (type) {
+            0x07 -> {
+                // Serial-Handshake - Payload als ASCII loggen.
+                val serial = runCatching {
+                    String(chunk, 6, len.coerceAtMost(chunk.size - 6), Charsets.US_ASCII)
+                }.getOrNull() ?: ""
+                Diagnostics.log(TAG, "Serial-Handshake der Kamera: \"$serial\" - starte GPS-Strom")
+                startStreamLoop()
+            }
+            0x05 -> { /* Keepalive/Ack - der 10-Hz-Strom laeuft bereits */ }
+            0x10 -> { /* Display-String (Mode/Battery/Rec-Timer) - nur loggen */ }
+            0x02 -> { /* Statuswort - nur loggen */ }
+            else -> {
+                Diagnostics.log(TAG,
+                    "ce81 Typ 0x%02X (%s)".format(type, Diagnostics.hex(chunk)))
+            }
         }
     }
 
@@ -421,5 +553,8 @@ class GattServerManager(
         private const val TAG = "GattServer"
         private const val DEFAULT_MTU = 23
         private const val ATT_HEADER_SIZE = 3
+
+        /** GPS-Liveness-Strom: ~10 Hz wie das Original-Remote (X4-Spec §5). */
+        private const val STREAM_INTERVAL_MS = 100L
     }
 }
