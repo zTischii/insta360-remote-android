@@ -52,6 +52,17 @@ class AppPreferences(context: Context) {
         get() = prefs.getString(KEY_CAMERA_SERIAL, "") ?: ""
         set(value) = prefs.edit().putString(KEY_CAMERA_SERIAL, value.trim().uppercase()).apply()
 
+    /**
+     * Experimentelle Direktkontrolle (Arch B): Nach dem Sehen einer Insta360-
+     * Kamera zusaetzlich ALS CENTRAL auf deren be80-Service verbinden und
+     * UploadGPS schreiben. Standard AUS - die Original-App macht das zwar,
+     * das Original-GPS-Remote aber NICHT; der Doppelrollen-Betrieb steht in
+     * Verdacht, Kamera-Trennungen (status=19) zu verursachen.
+     */
+    var enableDirectControl: Boolean
+        get() = prefs.getBoolean(KEY_ENABLE_DIRECT_CONTROL, false)
+        set(value) = prefs.edit().putBoolean(KEY_ENABLE_DIRECT_CONTROL, value).apply()
+
     companion object {
         private const val KEY_AUTO_START = "auto_start_on_boot"
         private const val KEY_USE_FUSED = "use_fused_location"
@@ -59,6 +70,7 @@ class AppPreferences(context: Context) {
         private const val KEY_ACTIVE_INTERVAL = "active_interval_ms"
         private const val KEY_IDLE_INTERVAL = "idle_interval_ms"
         private const val KEY_CAMERA_SERIAL = "camera_serial"
+        private const val KEY_ENABLE_DIRECT_CONTROL = "enable_direct_control"
 
         @Volatile private var instance: AppPreferences? = null
 

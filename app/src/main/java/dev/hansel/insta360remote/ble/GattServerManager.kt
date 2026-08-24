@@ -68,6 +68,23 @@ class GattServerManager(
     @Volatile
     private var lastFix: dev.hansel.insta360remote.location.GpsFix? = null
 
+    /** Letzter gueltiger Fix (GPS_FIX/DIFF/RTK) - Basis fuer den Status-A-Strom. */
+    @Volatile
+    private var lastValidFix: dev.hansel.insta360remote.location.GpsFix? = null
+
+    /**
+     * Fix-Hold-Fenster: Nach dem letzten gueltigen Fix senden wir noch bis zu
+     * 15 s lang Status-A-Saetze mit der letzten Position, BEVOR auf Void
+     * umgeschaltet wird. Grund: Eine einzige schlechte Standortmeldung
+     * (accuracy > 50 m, typisch drinnen) wuerde sonst sofort alles auf VOID
+     * kippen - die Kamera embeddet aber nur Status-A und wirft sonst irgend-
+     * wann das Remote ab (Logs 17:49: Trennung nach ~27 s reiner Void-Saetze).
+     */
+    private val FIX_HOLD_MS = 15000L
+
+    /** Aktueller Modus des Streams (fuer Wechsel-Logging). */
+    private var lastStreamVoid = true
+
     private var notifyCharRef: BluetoothGattCharacteristic? = null
 
 
@@ -223,9 +240,15 @@ class GattServerManager(
     /**
      * Neuesten Fix uebernehmen. Gesendet wird nicht hier, sondern vom
      * 10-Hz-Stream ([startStreamLoop]) - so wie beim Original-Remote.
+     *
+     * Gueltige Fixes (nicht NO_FIX) werden zusaetzlich als [lastValidFix]
+     * gehalten und stuetzen den Status-A-Strom fuer [FIX_HOLD_MS].
      */
     fun broadcastFix(fix: dev.hansel.insta360remote.location.GpsFix) {
         lastFix = fix
+        if (fix.fixQuality != dev.hansel.insta360remote.location.GpsFix.FixQuality.NO_FIX) {
+            lastValidFix = fix
+        }
         startStreamLoop()
     }
 
@@ -252,6 +275,7 @@ class GattServerManager(
         if (streamRunning) return
         streamRunning = true
         framesSent = 0; framesVoidSent = 0; framesRejected = 0
+        lastStreamVoid = true
         Diagnostics.log(TAG, "GPS-Strom gestartet (Intervall=${STREAM_INTERVAL_MS}ms, " +
             "MTU=$negotiatedMtu -> nutzbar ${negotiatedMtu - ATT_HEADER_SIZE}B/Notify)")
         streamHandler.post { pumpFrame() }
@@ -287,9 +311,33 @@ class GattServerManager(
             return
         }
 
-        val fix = lastFix ?: run { ensurePlaceholderFix(); lastFix!! }
-        val frame = encoder.encodeGpsUpdate(fix, 0)
-        val isVoid = fix.fixQuality == dev.hansel.insta360remote.location.GpsFix.FixQuality.NO_FIX
+        // Fix-Hold: Den letzten GUETIGEN Fix bis zu FIX_HOLD_MS weiterverwenden,
+        // bevor auf Void umgeschaltet wird (siehe Feld-Kommentar [FIX_HOLD_MS]).
+        val valid = lastValidFix
+        val holdOk = valid != null &&
+            (System.currentTimeMillis() - valid.utcEpochMillis) <= FIX_HOLD_MS
+        val nowVoid = !holdOk
+
+        val frame = if (!nowVoid) {
+            encoder.encodeGpsUpdate(valid!!, 0)
+        } else {
+            ensurePlaceholderFix()
+            encoder.encodeGpsUpdate(lastFix!!, 0)
+        }
+
+        if (nowVoid != lastStreamVoid && framesSent > 0) {
+            lastStreamVoid = nowVoid
+            Diagnostics.log(TAG, if (nowVoid) {
+                "GPS-Strom -> VOID (kein gueltiger Fix mehr; Hold von ${FIX_HOLD_MS / 1000}s abgelaufen). " +
+                    "Die Kamera embeddet nur Status-A-Saetze!"
+            } else {
+                "GPS-Strom -> AKTIV (${String.format(java.util.Locale.US, "%.5f", valid!!.latitude)}, " +
+                    String.format(java.util.Locale.US, "%.5f", valid!!.longitude) + ")"
+            })
+        }
+        lastStreamVoid = nowVoid
+
+        val isVoid = nowVoid
         framesSent++
         if (isVoid) framesVoidSent++
 
@@ -405,10 +453,21 @@ class GattServerManager(
                         device.name?.contains("X5", ignoreCase = true) == true ||
                         device.name?.contains("ONE", ignoreCase = true) == true
                     if (isInsta360) {
-                        Diagnostics.log(TAG, "Insta360-Kamera erkannt ($address) - verbinde als Central in 5s")
-                        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                            dev.hansel.insta360remote.ble.CameraClient.connect(context, device)
-                        }, 5000)
+                        if (AppPreferences.get(context).enableDirectControl) {
+                            Diagnostics.log(TAG, "Insta360-Kamera erkannt ($address) - verbinde als Central in 5s")
+                            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                                dev.hansel.insta360remote.ble.CameraClient.connect(context, device)
+                            }, 5000)
+                        } else {
+                            // Default: NUR Remote-Rolle (Arch A). Die parallele
+                            // Central-Verbindung auf be80 ist unnatuerlich fuer die
+                            // Kamera (Original-Remote macht das nicht) und steht in
+                            // Verdacht, die periodischen status=19-Trennungen zu
+                            // verursaachen. Zusaetzlich per Prefs zuschaltbar.
+                            Diagnostics.log(TAG,
+                                "Insta360 erkannt ($address) - Direktkontrolle (Arch B) deaktiviert, " +
+                                    "nur Remote-Rolle (Arch A)")
+                        }
                     } else {
                         Diagnostics.log(TAG, "Fremdes Gerät ignoriert (kein Insta360): $address name=${device.name}")
                     }
@@ -592,6 +651,12 @@ class GattServerManager(
         }
 
         override fun onStartFailure(errorCode: Int) {
+            if (errorCode == AdvertiseCallback.ADVERTISE_FAILED_ALREADY_STARTED) {
+                // Kein echter Fehler - wir liefen schon (Reconnect-Pfad startet doppelt)
+                advertising = true
+                Diagnostics.log(TAG, "Advertising lief bereits (Code 3) - belasse es aktiv")
+                return
+            }
             advertising = false
             Diagnostics.log(TAG, "Advertising fehlgeschlagen: " + errorCode)
         }
