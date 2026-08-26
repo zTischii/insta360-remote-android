@@ -58,7 +58,9 @@ class AdaptiveLocationController(
     private fun createSource(): LocationSource {
         val useFused = prefs.useFusedLocation && hasPlayServices()
         return if (useFused) {
-            FusedLocationSource(appContext)
+            // locationPriority ("balanced"/"high_accuracy") wird jetzt wirklich
+            // an den FusedLocationProvider durchgereicht (vorher hardcoded).
+            FusedLocationSource(appContext, prefs.locationPriority)
         } else {
             if (prefs.useFusedLocation) {
                 Diagnostics.log(TAG, "Play Services nicht verfuegbar - Fallback auf GPS-Provider")
