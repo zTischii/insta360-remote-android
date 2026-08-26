@@ -120,6 +120,54 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 - OEM-Deep-Links sind Best-Effort (nicht offiziell dokumentiert), immer mit
   Fallback auf die Standard-App-Info-Seite.
 
+## Problem: Doppelte „GPS Remote“-Einträge in der Kamera (Adressrotation)
+
+**Symptom:** Nach Kamera-Aus + Neustart des Handys zeigt die Kamera unter
+„Meine Geräte" **zwei** GPS-Remotes (alten + neuen Eintrag). Verbinden gelingt
+erst nach Löschen des alten Eintrags + Kamera-Neustart - obwohl es dasselbe
+Handy ist.
+
+**Ursache:** Die Kamera führt ihre Geräteliste pro **BLE-Adresse**. Das
+Original-Remote hat eine feste Werkadresse; unser Handy advertised über den
+Android-Stack, der die Absendeadresse selbst wählt - häufig als rotierende
+**Resolvable Private Address (RPA)**, u. a. bei Bluetooth aus/an, Reboot und
+teils periodisch (~15 min). Neue Adresse ⇒ die Kamera sieht ein „neues"
+Gerät. Da kein Bonding existiert, kennt die Kamera unsere IRK und kann die
+RPAs nicht auflösen - sie *kann* uns prinzipbedingt nicht als dasselbe Gerät
+erkennen. Eine öffentliche Android-API, um die eigene Werbeadresse zu pinnen,
+gibt es nicht.
+
+**Experimenteller Gegenversuch (Default aus):** Settings-Switch
+„Bonding-Experiment" (`enable_bonding`). Aktiviert verlangen ce81 (Write),
+ce83 (Read) und der ce82-CCCD Verschlüsselung (`PERMISSION_*_ENCRYPTED_MITM`)
+- die Kamera muss vor dem Subscriben/Schreiben SMP-Pairing starten und erhält
+dabei unsere **IRK**, sodass sie künftige RPAs demselben Eintrag zuordnen
+kann. Wirksam erst ab dem **nächsten Service-Start** (die GATT-Services werden
+dort registriert). Im Diagnose-Log erscheinen `BOND NONE -> BONDING ->
+BONDED`-Zeilen sowie `BONDING-EXPERIMENT AKTIV`.
+
+**Testprozedur:**
+1. Switch an → Service stoppen/starten (Log muss `BONDING-EXPERIMENT AKTIV` zeigen).
+2. Kamera verbinden - Log muss `BOND ... -> BONDED` zeigen, GPS-Strom muss laufen.
+3. Kamera aus, Handy-Bluetooth aus/an (oder Handy neu starten), Service neu
+   starten, Kamera wieder verbinden.
+4. Prüfen, ob die Kamera weiterhin nur **einen** Eintrag führt.
+5. Schlägt das Verbinden grundsätzlich fehl, unterstützt die Firmware kein
+   SMP → Switch wieder aus (Verhalten wie vorher).
+
+**Erster On-Device-Test (X4, Aug 2026):**
+Log zeigt `BONDING-EXPERIMENT AKTIV`, aber die Firmware startet **kein
+SMP-Pairing** auf die `GATT_INSUF_AUTHENTICATION: MITM required`-Ablehnungen
+hin - sie wiederholt Write-/CCCD-Versuche endlos (solange der Switch aktiv
+ist, kommt daher voraussichtlich **kein GPS** bei der Kamera an). Weiterhin
+zwei Einträge; nach Handy-Reboot lässt sich der alte Eintrag nicht mehr
+pairen, der frische paart sofort. Fazit: Permission-Deny allein reicht
+nicht, diese Firmware triggert kein Pairing daraus.
+
+**Falls Bonding scheitert:** Alternativ-Experiment wäre `createBond()` aus
+unserer Central-Rolle heraus (CameraClient). Als Alltags-Workaround bleibt
+das Löschen alter Kamera-Einträge vor dem Neuverbinden.
+
 ## Remote-Features (Live-Status + Tasten)
 
 Die App verhaelt sich jetzt naeher am Original-GPS-Remote und zeigt den

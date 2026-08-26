@@ -103,6 +103,31 @@
                 android:layout_height="wrap_content" />
         </LinearLayout>
 
+        <!-- Experiment: BLE-Bonding erzwingen (ENCRYPTED_MITM auf ce81/CCCD/ce83).
+             Ziel: Die Kamera pairt mit dem Handy und erhaelt unsere IRK, damit sie
+             wechselnde Advertising-Adressen (RPAs nach Reboot/BT-Toggle) dem selben
+             Remote-Eintrag zuordnen kann statt ein zweites "GPS Remote" anzulegen.
+             Wirkt erst nach Service-Neustart (GATT-Services werden dort gebaut). -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                android:id="@+id/bondingModeLabel"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="@string/status_bonding_experiment" />
+
+            <androidx.appcompat.widget.SwitchCompat
+                android:id="@+id/switchBonding"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content" />
+        </LinearLayout>
+
         <Button
             android:id="@+id/btnPermissions"
             android:layout_width="match_parent"

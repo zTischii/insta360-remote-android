@@ -78,6 +78,26 @@ class AppPreferences(context: Context) {
         get() = prefs.getBoolean(KEY_ENABLE_STATUS_QUERIES, true)
         set(value) = prefs.edit().putBoolean(KEY_ENABLE_STATUS_QUERIES, value).apply()
 
+    /**
+     * EXPERIMENT: BLE-Bonding (Pairing) mit der Kamera erzwingen (Default aus).
+     *
+     * Problem: Die Kamera fuehrt ihre "Meine Geraete"-Eintraege pro BLE-Adresse.
+     * Android waehlt die eigene Advertising-Adresse selbst und nutzt auf vielen
+     * Geraeten rotierende RPAs (u. a. bei BT aus/an, Reboot) - danach erscheint
+     * das Handy als "zweites" Remote. Ohne Bond kennt die Kamera unsere IRK und
+     * kann die RPAs nicht aufloesen.
+     *
+     * Mit diesem Flag verlangen ce81/ce82-CCCD/ce83 ENCRYPTED_MITM-Permissions;
+     * die Kamera muss dann vor Subscribe/Write SMP-Pairing starten und erhaelt
+     * dabei unsere IRK -> sie kann kuenftige RPAs dem selben Geraet zuordnen.
+     *
+     * Risiko: Unterstuetzt die Kamera-Firmware kein SMP, scheitert das Verbinden
+     * komplett (Flag dann wieder abschalten). Wirkt beim naechsten Service-Start.
+     */
+    var enableBonding: Boolean
+        get() = prefs.getBoolean(KEY_ENABLE_BONDING, false)
+        set(value) = prefs.edit().putBoolean(KEY_ENABLE_BONDING, value).apply()
+
     companion object {
         private const val KEY_AUTO_START = "auto_start_on_boot"
         private const val KEY_USE_FUSED = "use_fused_location"
@@ -87,6 +107,7 @@ class AppPreferences(context: Context) {
         private const val KEY_CAMERA_SERIAL = "camera_serial"
         private const val KEY_ENABLE_DIRECT_CONTROL = "enable_direct_control"
         private const val KEY_ENABLE_STATUS_QUERIES = "enable_status_queries"
+        private const val KEY_ENABLE_BONDING = "enable_bonding"
 
         @Volatile private var instance: AppPreferences? = null
 

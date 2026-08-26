@@ -125,7 +125,25 @@ class GattServerManager(
             gattServer = server
             confirmedServiceAdds = 0
             pendingServiceAdds = 2
-            val primaryService = Insta360Uuids.buildService()
+            // Bonding-Experiment (AppPreferences.enableBonding): Wenn aktiv,
+            // verlangen ce81/ce82-CCCD/ce83 Verschluesselung -> die Kamera muss
+            // SMP-Pairing starten (IRK-Austausch), damit sie kuenftige RPAs
+            // (Adressrotation nach Reboot/BT-Toggle) dem selben Remote-Eintrag
+            // zuordnen kann statt ein zweites anzulegen.
+            val requireBonding = try {
+                AppPreferences.get(context).enableBonding
+            } catch (_: Exception) {
+                false
+            }
+            if (requireBonding) {
+                Diagnostics.log(
+                    TAG,
+                    "BONDING-EXPERIMENT AKTIV: ce81/ce82-CCCD/ce83 verlangen ENCRYPTED_MITM - " +
+                        "die Kamera muss pairen, bevor sie subscriben/schreiben darf"
+                )
+            }
+            registerBondReceiver()
+            val primaryService = Insta360Uuids.buildService(requireEncryption = requireBonding)
             notifyCharRef = primaryService.getCharacteristic(Insta360Uuids.CHAR_NOTIFY_UUID)
             server.addService(primaryService)
             Diagnostics.log(TAG, "addService() fuer Primaer-Service abgeschickt")
@@ -157,6 +175,7 @@ class GattServerManager(
         advertising = false
         CameraScanner.stop()
         stopStreamLoop()
+        unregisterBondReceiver()
         try { gattServer?.close() } catch (_: Exception) {}
         gattServer = null
         synchronized(clients) { clients.clear() }
@@ -173,6 +192,64 @@ class GattServerManager(
     private fun cameraSerialOrNull(): String? =
         try { AppPreferences.get(context).cameraSerial.trim().uppercase().ifEmpty { null } }
         catch (_: Exception) { null }
+
+    // -------------------------------------- Bonding-Experiment (Diagnose)
+
+    /**
+     * Empfaenger fuer Bond-State-Aenderungen: macht SMP-Pairing im Diagnose-Log
+     * sichtbar (NONE -> BONDING -> BONDED), wenn das Bonding-Experiment aktiv
+     * ist (AppPreferences.enableBonding). Nur System-Broadcast, keine Flags noetig.
+     */
+    private var bondReceiver: android.content.BroadcastReceiver? = null
+
+    @android.annotation.SuppressLint("MissingPermission")
+    private fun registerBondReceiver() {
+        if (bondReceiver != null) return
+        if (!hasConnectPermission()) return
+        val receiver = object : android.content.BroadcastReceiver() {
+            override fun onReceive(ctx: Context?, intent: android.content.Intent?) {
+                if (!hasConnectPermission()) return
+                @Suppress("DEPRECATION")
+                val device = intent?.getParcelableExtra<android.bluetooth.BluetoothDevice>(
+                    android.bluetooth.BluetoothDevice.EXTRA_DEVICE
+                )
+                val newState =
+                    intent?.getIntExtra(android.bluetooth.BluetoothDevice.EXTRA_BOND_STATE, -1) ?: -1
+                val prevState =
+                    intent?.getIntExtra(android.bluetooth.BluetoothDevice.EXTRA_PREVIOUS_BOND_STATE, -1)
+                        ?: -1
+                val name = try { device?.name } catch (_: SecurityException) { null }
+                Diagnostics.log(
+                    TAG,
+                    "BOND ${bondStateName(prevState)} -> ${bondStateName(newState)} " +
+                        "${device?.address ?: "?"} ${name ?: ""}".trim()
+                )
+            }
+        }
+        try {
+            context.registerReceiver(
+                receiver,
+                android.content.IntentFilter(android.bluetooth.BluetoothDevice.ACTION_BOND_STATE_CHANGED)
+            )
+            bondReceiver = receiver
+            Diagnostics.log(TAG, "Bond-State-Empfaenger registriert")
+        } catch (e: Exception) {
+            Diagnostics.log(TAG, "Bond-Receiver-Registrierung fehlgeschlagen: " + e.message)
+        }
+    }
+
+    private fun unregisterBondReceiver() {
+        val receiver = bondReceiver ?: return
+        bondReceiver = null
+        try { context.unregisterReceiver(receiver) } catch (_: Exception) {}
+    }
+
+    private fun bondStateName(state: Int): String = when (state) {
+        android.bluetooth.BluetoothDevice.BOND_NONE -> "NONE"
+        android.bluetooth.BluetoothDevice.BOND_BONDING -> "BONDING"
+        android.bluetooth.BluetoothDevice.BOND_BONDED -> "BONDED"
+        else -> "?$state"
+    }
 
     // ------------------------------------------------------------ Advertising
 

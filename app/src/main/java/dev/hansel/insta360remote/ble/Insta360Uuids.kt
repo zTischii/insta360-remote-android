@@ -72,41 +72,57 @@ object Insta360Uuids {
     val SERVICE_PARCEL_UUID: ParcelUuid = ParcelUuid(SERVICE_UUID)
     val SECONDARY_SERVICE_PARCEL_UUID: ParcelUuid = ParcelUuid(SECONDARY_SERVICE_UUID)
 
-    private fun readChar(uuid: UUID, value: ByteArray): BluetoothGattCharacteristic =
+    private fun readChar(
+        uuid: UUID,
+        value: ByteArray,
+        permission: Int = BluetoothGattCharacteristic.PERMISSION_READ,
+    ): BluetoothGattCharacteristic =
         BluetoothGattCharacteristic(
             uuid,
             BluetoothGattCharacteristic.PROPERTY_READ,
-            BluetoothGattCharacteristic.PERMISSION_READ
+            permission
         ).apply { this.value = value }
 
     /**
-     * Baut beide GATT-Services exakt nach dem Vorbild des ESP32-Sketches.
+     * Baut den Primaer-Service (ce80/81/82/83) nach dem Vorbild des ESP32-Sketches.
+     *
+     * @param requireEncryption Bonding-Experiment (AppPreferences.enableBonding):
+     *   Write-/Read-/CCCD-Permissions werden zu *_ENCRYPTED_MITM erhoeht. Ein
+     *   nicht verschluesselnder Central bekommt dann ATT "Insufficient
+     *   Authentication" und muss SMP-Pairing starten -> Bond -> IRK-Austausch.
      */
-    fun buildService(): BluetoothGattService {
+    fun buildService(requireEncryption: Boolean = false): BluetoothGattService {
+        val writePermission =
+            if (requireEncryption) BluetoothGattCharacteristic.PERMISSION_WRITE_ENCRYPTED_MITM
+            else BluetoothGattCharacteristic.PERMISSION_WRITE
+        val readPermission =
+            if (requireEncryption) BluetoothGattCharacteristic.PERMISSION_READ_ENCRYPTED_MITM
+            else BluetoothGattCharacteristic.PERMISSION_READ
+
         val service = BluetoothGattService(SERVICE_UUID, BluetoothGattService.SERVICE_TYPE_PRIMARY)
 
         val writeChar = BluetoothGattCharacteristic(
             CHAR_WRITE_UUID,
             BluetoothGattCharacteristic.PROPERTY_WRITE,
-            BluetoothGattCharacteristic.PERMISSION_WRITE
+            writePermission
         )
 
         val notifyChar = BluetoothGattCharacteristic(
             CHAR_NOTIFY_UUID,
             BluetoothGattCharacteristic.PROPERTY_NOTIFY,
-            BluetoothGattCharacteristic.PERMISSION_READ
+            readPermission
         )
         notifyChar.value = byteArrayOf(0x00)
         val cccd = BluetoothGattDescriptor(
             CCCD_UUID,
-            BluetoothGattDescriptor.PERMISSION_WRITE or BluetoothGattDescriptor.PERMISSION_READ
+            writePermission or readPermission
         )
         // Wie ESP32 BLE2902 mit setNotifications(true)+setIndications(true):
         // initialer CCCD-Wert 0x0003.
         cccd.value = byteArrayOf(0x03, 0x00)
         notifyChar.addDescriptor(cccd)
 
-        val extraChar = readChar(CHAR_EXTRA_UUID, byteArrayOf(0x01, 0x02)) // uint16 0x0201 LE
+        val extraChar = readChar(CHAR_EXTRA_UUID, byteArrayOf(0x01, 0x02), readPermission) // uint16 0x0201 LE
 
         service.addCharacteristic(writeChar)
         service.addCharacteristic(notifyChar)

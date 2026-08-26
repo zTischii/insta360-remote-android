@@ -46,4 +46,12 @@
     <string name="location_mode_balanced">Akkusparend (Balanced)</string>
     <string name="location_mode_high">Hohe Genauigkeit (GNSS)</string>
     <string name="toast_location_priority_changed">GPS-Priorität geändert – wirkt sofort</string>
+
+    <!-- Experiment: BLE-Bonding gegen doppelte Remote-Einträge in der Kamera.
+         Aktiviert verlangt der GATT-Server Verschlüsselung, sodass die Kamera
+         pairen muss und unsere IRK erhält (RPA-Auflösung trotz Adressrotation). -->
+    <string name="status_bonding_experiment">Bonding-Experiment: %1$s</string>
+    <string name="bonding_mode_on">An (Kamera muss pairen)</string>
+    <string name="bonding_mode_off">Aus</string>
+    <string name="toast_bonding_changed">Bonding-Modus geändert – wirkt beim nächsten Service-Start</string>
 </resources>

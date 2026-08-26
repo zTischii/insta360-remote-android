@@ -51,6 +51,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     )
     val highAccuracyLocation: StateFlow<Boolean> = _highAccuracyLocation.asStateFlow()
 
+    /**
+     * true = Bonding-Experiment aktiv (GATT-Server verlangt Verschluesselung,
+     * damit die Kamera pairen muss und unsere IRK erhaelt). Default aus.
+     */
+    private val _bondingEnabled = MutableStateFlow(prefs.enableBonding)
+    val bondingEnabled: StateFlow<Boolean> = _bondingEnabled.asStateFlow()
+
     /** Kamera-Status (REC/Modus/Akku/Speicher) als mehrzeiliger Text. */
     private val cameraInfoFlow = combine(
         ServiceStatus.cameraDisplay,
@@ -161,6 +168,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             "GPS-Prioritaet: ${if (enabled) "high_accuracy" else "balanced"}"
         )
         dev.hansel.insta360remote.core.ServiceStatus.bumpLocationConfigVersion()
+    }
+
+    /**
+     * Bonding-Switch (Experiment gegen doppelte Kamera-Eintraege durch
+     * Adressrotation): Persistiert das Pref. Wirkt erst beim naechsten
+     * Service-Start, da die GATT-Services dort registriert werden.
+     */
+    fun setBondingEnabled(enabled: Boolean) {
+        if (prefs.enableBonding == enabled && _bondingEnabled.value == enabled) return
+        prefs.enableBonding = enabled
+        _bondingEnabled.value = enabled
+        Diagnostics.log("UI", "Bonding-Experiment: $enabled (wirkt beim naechsten Service-Start)")
     }
 
     /**

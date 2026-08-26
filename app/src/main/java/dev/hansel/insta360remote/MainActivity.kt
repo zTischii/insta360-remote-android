@@ -112,6 +112,9 @@ class MainActivity : AppCompatActivity() {
         // ohne dass der Service oder die BLE-Verbindung neu gestartet wird.
         setupLocationPrioritySwitch()
 
+        // Einstellungen: Bonding-Experiment - wirkt beim naechsten Service-Start.
+        setupBondingSwitch()
+
         observeUiState()
         showOemHint()
         maybeAutoStart()
@@ -208,6 +211,35 @@ class MainActivity : AppCompatActivity() {
             if (checked == viewModel.highAccuracyLocation.value) return@setOnCheckedChangeListener
             viewModel.setLocationHighAccuracy(checked)
             Toast.makeText(this, R.string.toast_location_priority_changed, Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    /**
+     * Bindet den Bonding-Experiment-Switch an [MainViewModel.bondingEnabled]
+     * (gleiche Render-/Listener-Logik wie der GPS-Prioritaet-Switch).
+     */
+    private fun setupBondingSwitch() {
+        val sw = findViewById<SwitchCompat>(R.id.switchBonding)
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                viewModel.bondingEnabled.collect { enabled ->
+                    renderBondingMode(sw, enabled)
+                }
+            }
+        }
+    }
+
+    private fun renderBondingMode(sw: SwitchCompat, enabled: Boolean) {
+        sw.setOnCheckedChangeListener(null)
+        sw.isChecked = enabled
+        findViewById<TextView>(R.id.bondingModeLabel).text = getString(
+            R.string.status_bonding_experiment,
+            getString(if (enabled) R.string.bonding_mode_on else R.string.bonding_mode_off)
+        )
+        sw.setOnCheckedChangeListener { _, checked ->
+            if (checked == viewModel.bondingEnabled.value) return@setOnCheckedChangeListener
+            viewModel.setBondingEnabled(checked)
+            Toast.makeText(this, R.string.toast_bonding_changed, Toast.LENGTH_LONG).show()
         }
     }
 
