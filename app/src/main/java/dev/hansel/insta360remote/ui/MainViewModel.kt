@@ -45,6 +45,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _autoStartEnabled = MutableStateFlow(prefs.autoStartOnBoot)
     val autoStartEnabled: StateFlow<Boolean> = _autoStartEnabled.asStateFlow()
 
+    /** true = GPS-Prioritaet "high_accuracy", false = "balanced" (Default). */
+    private val _highAccuracyLocation = MutableStateFlow(
+        prefs.locationPriority == dev.hansel.insta360remote.location.FusedLocationSource.PRIORITY_HIGH_ACCURACY
+    )
+    val highAccuracyLocation: StateFlow<Boolean> = _highAccuracyLocation.asStateFlow()
+
     /** Kamera-Status (REC/Modus/Akku/Speicher) als mehrzeiliger Text. */
     private val cameraInfoFlow = combine(
         ServiceStatus.cameraDisplay,
@@ -134,6 +140,27 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         prefs.autoStartOnBoot = enabled
         _autoStartEnabled.value = enabled
         Diagnostics.log("UI", "Auto-Start nach Boot: $enabled")
+    }
+
+    /**
+     * GPS-Prioritaet-Switch (Settings): Persistiert das Pref und stoesst ueber
+     * den ServiceStatus-Konfigurationszaehler einen sofortigen Neustart der
+     * Standortversorgung an (falls der Service laeuft). BLE bleibt unberuehrt.
+     */
+    fun setLocationHighAccuracy(enabled: Boolean) {
+        val value = if (enabled) {
+            dev.hansel.insta360remote.location.FusedLocationSource.PRIORITY_HIGH_ACCURACY
+        } else {
+            dev.hansel.insta360remote.location.FusedLocationSource.PRIORITY_BALANCED
+        }
+        if (prefs.locationPriority == value && _highAccuracyLocation.value == enabled) return
+        prefs.locationPriority = value
+        _highAccuracyLocation.value = enabled
+        Diagnostics.log(
+            "UI",
+            "GPS-Prioritaet: ${if (enabled) "high_accuracy" else "balanced"}"
+        )
+        dev.hansel.insta360remote.core.ServiceStatus.bumpLocationConfigVersion()
     }
 
     /**

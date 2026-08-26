@@ -40,4 +40,10 @@
     <string name="notif_detail_storage">Speicher: %1$s%2$s frei · %3$d Dateien</string>
     <string name="notif_detail_gps">GPS: %1$s</string>
     <string name="notif_detail_sends">GPS-Sends: %1$d</string>
+
+    <!-- Einstellungen: GPS-Prioritaet -->
+    <string name="status_location_priority">GPS-Priorität: %1$s</string>
+    <string name="location_mode_balanced">Akkusparend (Balanced)</string>
+    <string name="location_mode_high">Hohe Genauigkeit (GNSS)</string>
+    <string name="toast_location_priority_changed">GPS-Priorität geändert – wirkt sofort</string>
 </resources>

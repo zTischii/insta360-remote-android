@@ -52,6 +52,14 @@ object ServiceStatus {
     private val _cameraBattery = MutableStateFlow<CameraBatteryInfo?>(null)
     val cameraBattery: StateFlow<CameraBatteryInfo?> = _cameraBattery.asStateFlow()
 
+    /**
+     * Versionszaehler fuer ortbezogene Konfiguration (z.B. locationPriority-
+     * Switch): Der Service beobachtet diesen Flow und startet bei Erhoehung
+     * die Standortversorgung sofort neu - ohne BLE zur Kamera anzufassen.
+     */
+    private val _locationConfigVersion = MutableStateFlow(0)
+    val locationConfigVersion: StateFlow<Int> = _locationConfigVersion.asStateFlow()
+
     fun setRunning(running: Boolean) { _isRunning.value = running }
     fun setBleState(state: BleConnectionState) { _bleState.value = state }
     fun setLastFix(fix: GpsFix?) { _lastFix.value = fix }
@@ -60,6 +68,7 @@ object ServiceStatus {
     fun setCameraDisplay(state: CameraDisplayState) { _cameraDisplay.value = state }
     fun setCameraStorage(info: CameraStorageInfo) { _cameraStorage.value = info }
     fun setCameraBattery(info: CameraBatteryInfo) { _cameraBattery.value = info }
+    fun bumpLocationConfigVersion() { _locationConfigVersion.value += 1 }
 
     fun resetSession() {
         _bleState.value = BleConnectionState.Idle

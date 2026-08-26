@@ -40,6 +40,10 @@ class GpsRemoteService : LifecycleService() {
     private var gattServerManager: GattServerManager? = null
     private var locationController: AdaptiveLocationController? = null
     private var locationJob: Job? = null
+
+    /** Beobachtet den locationConfigVersion-Zaehler (Pref-Switch live). */
+    private var locationConfigJob: Job? = null
+
     private var wakeLock: PowerManager.WakeLock? = null
 
     /** Aktive Notification-Updates (Flow-Beobachter + 1-Hz-Rec-Ticker). */
@@ -57,6 +61,7 @@ class GpsRemoteService : LifecycleService() {
         startInForeground(buildNotification())
         lastNotificationKey = composeNotificationKey()
         observeStatusForNotification()
+        observeLocationConfigChanges()
         Diagnostics.log(TAG, "Foreground-Service erstellt")
     }
 
@@ -75,8 +80,6 @@ class GpsRemoteService : LifecycleService() {
     private fun ensureStarted() {
         if (gattServerManager != null) return // bereits laufend
 
-        val prefs = AppPreferences.get(this)
-
         gattServerManager = GattServerManager(
             context = this,
             // VERIFIZIERTES X4-Format (NMEA-RMC in FC-EF-FE-83-Frames, 10 Hz):
@@ -89,6 +92,19 @@ class GpsRemoteService : LifecycleService() {
 
         acquireWakeLock()
 
+        startLocationUpdates()
+    }
+
+    /**
+     * Startet die adaptive Standortversorgung. Bei bereits laufender Pipeline
+     * wird diese sauber abgebaut (callbackFlow/awaitClose entfernt die
+     * Location-Updates, MotionMonitor gestoppt), bevor neu gestartet wird -
+     * so reagiert der locationPriority-Switch sofort, ohne den BLE-Link zur
+     * Kamera zu beeintraechtigen.
+     */
+    private fun startLocationUpdates() {
+        stopLocationUpdates()
+        val prefs = AppPreferences.get(this)
         locationController = AdaptiveLocationController(this, prefs)
         locationJob = lifecycleScope.launch {
             try {
@@ -110,9 +126,32 @@ class GpsRemoteService : LifecycleService() {
         }
     }
 
+    private fun stopLocationUpdates() {
+        locationJob?.cancel(); locationJob = null
+        locationController?.stop(); locationController = null
+    }
+
+    /**
+     * Beobachtet den Konfigurations-Zaehler aus [ServiceStatus] und startet
+     * bei jeder Erhoehung die Standortversorgung neu (locationPriority-Switch).
+     */
+    private fun observeLocationConfigChanges() {
+        locationConfigJob?.cancel()
+        locationConfigJob = lifecycleScope.launch {
+            var seen = ServiceStatus.locationConfigVersion.value
+            ServiceStatus.locationConfigVersion.collect { version ->
+                if (version == seen) return@collect
+                seen = version
+                Diagnostics.log(TAG, "locationPriority geaendert - wende sofort an")
+                startLocationUpdates()
+            }
+        }
+    }
+
     override fun onDestroy() {
         notificationJob?.cancel(); notificationJob = null
         recTickerJob?.cancel(); recTickerJob = null
+        locationConfigJob?.cancel(); locationConfigJob = null
         locationJob?.cancel()
         locationController?.stop()
         locationController = null

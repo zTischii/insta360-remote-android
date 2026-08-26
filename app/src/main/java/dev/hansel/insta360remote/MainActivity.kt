@@ -20,6 +20,7 @@ import androidx.lifecycle.repeatOnLifecycle
 import dev.hansel.insta360remote.core.BleConnectionState
 import dev.hansel.insta360remote.system.OemBatteryHelper
 import dev.hansel.insta360remote.ui.MainViewModel
+import androidx.appcompat.widget.SwitchCompat
 import kotlinx.coroutines.launch
 
 /**
@@ -107,6 +108,10 @@ class MainActivity : AppCompatActivity() {
             )
         }
 
+        // Einstellungen: GPS-Prioritaet (balanced/high_accuracy) - wirkt sofort,
+        // ohne dass der Service oder die BLE-Verbindung neu gestartet wird.
+        setupLocationPrioritySwitch()
+
         observeUiState()
         showOemHint()
         maybeAutoStart()
@@ -173,6 +178,37 @@ class MainActivity : AppCompatActivity() {
         val hint = OemBatteryHelper.detectOem(this)
         findViewById<TextView>(R.id.oemHint).text =
             getString(R.string.oem_hint, "${hint.manufacturer}: ${hint.hint}")
+    }
+
+    /**
+     * Bindet den GPS-Prioritaet-Switch an [MainViewModel.highAccuracyLocation].
+     * Der Listener wird bei jedem Render-Durchlauf frisch gesetzt, damit
+     * programmatische isChecked-Aenderungen nicht als User-Eingabe zurueck-
+     * laufen (Endlosschleifen-Schutz).
+     */
+    private fun setupLocationPrioritySwitch() {
+        val sw = findViewById<SwitchCompat>(R.id.switchLocationPriority)
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                viewModel.highAccuracyLocation.collect { enabled ->
+                    renderLocationMode(sw, enabled)
+                }
+            }
+        }
+    }
+
+    private fun renderLocationMode(sw: SwitchCompat, enabled: Boolean) {
+        sw.setOnCheckedChangeListener(null)
+        sw.isChecked = enabled
+        findViewById<TextView>(R.id.locationModeLabel).text = getString(
+            R.string.status_location_priority,
+            getString(if (enabled) R.string.location_mode_high else R.string.location_mode_balanced)
+        )
+        sw.setOnCheckedChangeListener { _, checked ->
+            if (checked == viewModel.highAccuracyLocation.value) return@setOnCheckedChangeListener
+            viewModel.setLocationHighAccuracy(checked)
+            Toast.makeText(this, R.string.toast_location_priority_changed, Toast.LENGTH_SHORT).show()
+        }
     }
 
     private fun feedback(ok: Boolean, okMsg: String, failMsg: String) {
