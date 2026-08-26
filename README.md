@@ -119,3 +119,42 @@ adb install app/build/outputs/apk/debug/app-debug.apk
   senden; die Kamera diktiert das Intervall. Wir antworten nur auf MTU-Verhandlung.
 - OEM-Deep-Links sind Best-Effort (nicht offiziell dokumentiert), immer mit
   Fallback auf die Standard-App-Info-Seite.
+
+## Remote-Features (Live-Status + Tasten)
+
+Die App verhaelt sich jetzt naeher am Original-GPS-Remote und zeigt den
+Kamera-Zustand live in **Notification** (BigText) und **Hauptbildschirm**:
+
+### Aufnahme-Timer & Modus (verifizierter Weg, Architektur A)
+- Die Kamera schreibt ~1 Hz Display-Strings auf ce81 (Typ 0x10,
+  X4-Spec §6). `CameraDisplayParser` klassifiziert sie inhaltsbasiert:
+  - `.HH:MM:SS` -> **Aufnahme aktiv**, Zaehler = verstrichene Sekunden.
+    Das ist der zuverlaessige REC-Indikator (das 0x02-Statuswort ist es
+    laut Sniff nicht).
+  - `4K|30|UW` -> Modus/Aufloesung. `13h09m` -> Akku-Restlaufzeit-Schaetzung
+    der Kamera.
+- Notification: Titel wird bei Aufnahme zu `● REC HH:MM:SS`; ein 1-Hz-Ticker
+  haelt den Timer zwischen den Display-Frames aktuell. Bei Trennung wird der
+  Timer zurueckgesetzt.
+- GPS-Statuszeile: `GPS Fix · N Sat · ±X m` / `kein Fix` / `Fix alt (Ns)`.
+
+### Speicher & Kamera-Akku (experimentell, Architektur B)
+- Ueber die bestehende Central-Verbindung (MTU-Bootstrap) werden nun
+  optional Service-Discovery + be82-CCCD durchgefuehrt und alle 30 s zwei
+  Header16-Queries gesendet (Codes laut xaionaro-go/insta360ctl, X-Serie):
+  - `0x10` GetStorageInfo -> totalMB/freeMB/fileCount (uint32 LE)
+  - `0x12` GetBatteryInfo -> Level % (+ Spannung mV)
+- Antworten werden ueber Sequence-Nummer zugeordnet; Fehlercodes
+  (400/500/501) fuehren nicht zum Abbruch - Werte bleiben dann "-".
+- Abschaltbar via Pref `enable_status_queries` (Default: an, zusammen mit
+  `enable_direct_control`). Da das Protokoll hierfuer nicht sniffer-
+  verifiziert ist, sind die Werte als experimentell zu betrachten.
+
+### Remote-Tasten (Ausloeser / Modus)
+- Zwei Buttons im Hauptbildschirm senden die Original-Kommandoframes des
+  GPS-Remotes auf ce82 (`FC EF FE 86 <SN> 03 01 <action> <param>`):
+  Shutter = `02 00`, Modus = `01 00`. SN startet pro Verbindung bei 0 und
+  inkrementiert um 2 je Event (Spec §4).
+- Ohne verbundene Kamera gibt die UI ein Toast-Feedback statt stiller
+  Fehler.
+

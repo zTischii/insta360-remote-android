@@ -40,16 +40,34 @@ object ServiceStatus {
     private val _lastCameraPacketAt = MutableStateFlow(0L)
     val lastCameraPacketAt: StateFlow<Long> = _lastCameraPacketAt.asStateFlow()
 
+    /** Anzeige-/Aufnahme-Zustand der Kamera (ce81 Display-Strings, Typ 0x10). */
+    private val _cameraDisplay = MutableStateFlow(CameraDisplayState())
+    val cameraDisplay: StateFlow<CameraDisplayState> = _cameraDisplay.asStateFlow()
+
+    /** Speicher-Infos der Kamera (experimentelle Arch-B-Abfrage, null = unbekannt). */
+    private val _cameraStorage = MutableStateFlow<CameraStorageInfo?>(null)
+    val cameraStorage: StateFlow<CameraStorageInfo?> = _cameraStorage.asStateFlow()
+
+    /** Akku-Infos der Kamera (experimentelle Arch-B-Abfrage, null = unbekannt). */
+    private val _cameraBattery = MutableStateFlow<CameraBatteryInfo?>(null)
+    val cameraBattery: StateFlow<CameraBatteryInfo?> = _cameraBattery.asStateFlow()
+
     fun setRunning(running: Boolean) { _isRunning.value = running }
     fun setBleState(state: BleConnectionState) { _bleState.value = state }
     fun setLastFix(fix: GpsFix?) { _lastFix.value = fix }
     fun incrementNotifyCount(delta: Long = 1) { _notifyCount.value += delta }
     fun markCameraPacket() { _lastCameraPacketAt.value = System.currentTimeMillis() }
+    fun setCameraDisplay(state: CameraDisplayState) { _cameraDisplay.value = state }
+    fun setCameraStorage(info: CameraStorageInfo) { _cameraStorage.value = info }
+    fun setCameraBattery(info: CameraBatteryInfo) { _cameraBattery.value = info }
 
     fun resetSession() {
         _bleState.value = BleConnectionState.Idle
         _lastFix.value = null
         _notifyCount.value = 0L
         _lastCameraPacketAt.value = 0L
+        _cameraDisplay.value = CameraDisplayState()
+        _cameraStorage.value = null
+        _cameraBattery.value = null
     }
 }

@@ -9,3 +9,6 @@
 .kotlin/
 .externalNativeBuild
 .cxx
+
+# Lokale Testaufnahmen (1+ GB, gehoeren nicht ins Repo)
+/test_video/

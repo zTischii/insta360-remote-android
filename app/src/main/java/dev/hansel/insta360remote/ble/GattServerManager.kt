@@ -73,6 +73,13 @@ class GattServerManager(
     private var lastValidFix: dev.hansel.insta360remote.location.GpsFix? = null
 
     /**
+     * Geparster Anzeige-/Aufnahme-Zustand der Kamera aus den ce81-0x10-Frames
+     * (Rec-Timer/Modus/Akku). Wird bei jedem Frame gemerged und nach
+     * [ServiceStatus] gespiegelt (Quelle fuer Notification + UI).
+     */
+    private var cameraDisplay = dev.hansel.insta360remote.core.CameraDisplayState()
+
+    /**
      * Fix-Hold-Fenster: Nach dem letzten gueltigen Fix senden wir noch bis zu
      * 15 s lang Status-A-Saetze mit der letzten Position, BEVOR auf Void
      * umgeschaltet wird. Grund: Eine einzige schlechte Standortmeldung
@@ -493,6 +500,7 @@ class GattServerManager(
                     val stillConnected = synchronized(clients) { clients.isNotEmpty() }
                     if (!stillConnected) {
                         stopStreamLoop()
+                        resetCameraDisplayOnDisconnect()
                         ServiceStatus.setBleState(BleConnectionState.Advertising)
                         Diagnostics.log(TAG, "Kamera getrennt (status=" + status + ") - warte auf Reconnect")
                         restartAdvertisingIfStopped()
@@ -649,14 +657,142 @@ class GattServerManager(
                 startStreamLoop()
             }
             0x05 -> { /* Keepalive/Ack - der 10-Hz-Strom laeuft bereits */ }
-            0x10 -> { /* Display-String (Mode/Battery/Rec-Timer) - nur loggen */ }
-            0x02 -> { /* Statuswort - nur loggen */ }
+            0x10 -> handleDisplayString(chunk)
+            0x02 -> { /* Statuswort - laut Spec kein verlaesslicher REC-Indikator */ }
             else -> {
                 Diagnostics.log(TAG,
                     "ce81 Typ 0x%02X (%s)".format(type, Diagnostics.hex(chunk)))
             }
         }
     }
+
+    /**
+     * Wertet einen ce81-Display-String aus (Typ 0x10): Aufnahme-Timer,
+     * Modus oder Akku-Runtime. Aktualisiert [cameraDisplay] + [ServiceStatus].
+     *
+     * Quelle: X4-Spec §6 - waehrend der Aufnahme zaehlt ".HH:MM:SS" hoch
+     * (1 Hz), danach kehrt der String zu Modus/Akku zurueck. Das ist der
+     * verlaessliche Aufnahme-Indikator (das 0x02-Statuswort ist es nicht).
+     */
+    private fun handleDisplayString(chunk: ByteArray) {
+        val parsed = CameraDisplayParser.parse(chunk)
+        if (parsed == null) {
+            CameraDisplayParser.logUnparseable(chunk)
+            return
+        }
+
+        val now = System.currentTimeMillis()
+        val prev = cameraDisplay
+        val next = when (parsed.kind) {
+            CameraDisplayParser.Kind.RECORDING_TIMER ->
+                prev.copy(
+                    recordingElapsedSeconds = parsed.elapsedSeconds,
+                    lastRaw = parsed.text,
+                    updatedAtMillis = now,
+                )
+            CameraDisplayParser.Kind.BATTERY_RUNTIME ->
+                prev.copy(
+                    batteryRuntimeString = parsed.text.trim(),
+                    // Timer-String verschwindet bei Stopp -> Aufnahme beendet:
+                    recordingElapsedSeconds = null,
+                    lastRaw = parsed.text,
+                    updatedAtMillis = now,
+                )
+            CameraDisplayParser.Kind.MODE ->
+                prev.copy(
+                    modeString = parsed.text,
+                    recordingElapsedSeconds = null,
+                    lastRaw = parsed.text,
+                    updatedAtMillis = now,
+                )
+            CameraDisplayParser.Kind.OTHER ->
+                prev.copy(lastRaw = parsed.text, updatedAtMillis = now)
+        }
+
+        // Log nur bei relevanten Wechseln (nicht bei jedem 1-Hz-Timer-Tick).
+        if (next.isRecording != prev.isRecording) {
+            Diagnostics.log(TAG, if (next.isRecording) {
+                "KAMERA HAT AUFNAHME GESTARTET"
+            } else {
+                "Aufnahme beendet (${prev.recordingElapsedSeconds ?: 0}s)"
+            })
+        } else if (parsed.kind == CameraDisplayParser.Kind.MODE && parsed.text != prev.modeString) {
+            Diagnostics.log(TAG, "Kamera-Modus: ${parsed.text}")
+        } else if (parsed.kind == CameraDisplayParser.Kind.BATTERY_RUNTIME &&
+            parsed.text.trim() != prev.batteryRuntimeString
+        ) {
+            Diagnostics.log(TAG, "Kamera-Akku-Runtime: ${parsed.text.trim()}")
+        }
+
+        cameraDisplay = next
+        ServiceStatus.setCameraDisplay(next)
+    }
+
+    /**
+     * Setzt den Anzeige-Zustand bei Kamera-Trennung zurueck: Eine laufende
+     * Aufnahme kann von uns nicht mehr beobachtet werden - der Notification-
+     * Rec-Timer darf nicht "ewig" weiterlaufen.
+     */
+    private fun resetCameraDisplayOnDisconnect() {
+        val prev = cameraDisplay
+        if (prev.recordingElapsedSeconds != null || prev.lastRaw != null) {
+            cameraDisplay = prev.copy(recordingElapsedSeconds = null, updatedAtMillis = System.currentTimeMillis())
+            ServiceStatus.setCameraDisplay(cameraDisplay)
+            Diagnostics.log(TAG, "Anzeige-Zustand der Kamera zurueckgesetzt (Trennung)")
+        }
+    }
+
+    // -------------------------------------- Remote-Kommandos (Original-Tasten)
+
+    /**
+     * Sendet ein Original-Remote-Kommando an die Kamera (ce82-Notify),
+     * Format X4-Spec §4 / xaionaro-go/insta360ctl commands_remote.go:
+     *
+     * ```
+     * FC EF FE 86 <SN> 03 01 <ACTION> <PARAM>
+     * ```
+     *
+     * SN startet laut Spec bei jeder Verbindung bei 0 und inkrementiert um 2
+     * pro Event (Reset passiert in onDescriptorWriteRequest/onDisconnect).
+     * Bekannte Kommandos: Shutter (02 00), Modus (01 00), Screen (00 00),
+     * PowerOff (00 03).
+     */
+    fun sendRemoteCommand(action: Byte, param: Byte, label: String): Boolean {
+        val characteristic = notifyCharRef ?: return false
+        val targets = synchronized(clients) { clients.toList() }
+        if (targets.isEmpty()) return false
+
+        val frame = byteArrayOf(
+            0xFC.toByte(), 0xEF.toByte(), 0xFE.toByte(), 0x86.toByte(),
+            buttonSn.toByte(), 0x03, 0x01, action, param,
+        )
+        buttonSn = (buttonSn + 2) and 0xFF
+
+        var delivered = false
+        for (device in targets) {
+            characteristic.value = frame
+            delivered = try {
+                gattServer?.notifyCharacteristicChanged(device, characteristic, false) ?: false
+            } catch (e: Exception) {
+                Diagnostics.log(TAG, "Kommando-Notify fehlgeschlagen: " + e.message)
+                false
+            } || delivered
+        }
+        Diagnostics.log(TAG, "Remote-Kommando '$label' ($action/$param) an ${targets.size} Client(s): $delivered")
+        return delivered
+    }
+
+    /** Ausloeser: Foto bzw. Start/Stopp der Aufnahme (je nach Kamera-Modus). */
+    fun sendShutter(): Boolean = sendRemoteCommand(0x02, 0x00, "SHUTTER")
+
+    /** Durchschalten der Aufnahme-Modi (Video/Photo/Timelapse...). */
+    fun sendModeCycle(): Boolean = sendRemoteCommand(0x01, 0x00, "MODE")
+
+    /** Kamera-Display aufwecken. */
+    fun sendScreenWake(): Boolean = sendRemoteCommand(0x00, 0x00, "SCREEN")
+
+    /** Kamera ausschalten. */
+    fun sendPowerOff(): Boolean = sendRemoteCommand(0x00, 0x03, "POWER_OFF")
 
     private val advertiseCallback = object : AdvertiseCallback() {
         override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
@@ -683,5 +819,13 @@ class GattServerManager(
 
         /** GPS-Liveness-Strom: ~10 Hz wie das Original-Remote (X4-Spec §5). */
         private const val STREAM_INTERVAL_MS = 100L
+
+        /**
+         * Aktive Instanz solange der Foreground-Service laeuft - damit die UI
+         * Remote-Kommandos (Ausloeser/Modus) senden kann. Bewusst ohne DI
+         * (gleicher Stil wie [ServiceStatus]).
+         */
+        @Volatile
+        var activeInstance: GattServerManager? = null
     }
 }

@@ -19,10 +19,12 @@ import dev.hansel.insta360remote.ble.GattServerManager
 import dev.hansel.insta360remote.ble.NmeaGpsFrameEncoder
 import dev.hansel.insta360remote.core.AppPreferences
 import dev.hansel.insta360remote.core.BleConnectionState
+import dev.hansel.insta360remote.core.CameraStatusFormatter
 import dev.hansel.insta360remote.core.Diagnostics
 import dev.hansel.insta360remote.core.ServiceStatus
 import dev.hansel.insta360remote.location.AdaptiveLocationController
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
 
 /**
@@ -40,12 +42,21 @@ class GpsRemoteService : LifecycleService() {
     private var locationJob: Job? = null
     private var wakeLock: PowerManager.WakeLock? = null
 
+    /** Aktive Notification-Updates (Flow-Beobachter + 1-Hz-Rec-Ticker). */
+    private var notificationJob: Job? = null
+    private var recTickerJob: Job? = null
+
+    /** Dedupe-Schluessel der zuletzt angezeigten Notification (Inhalt). */
+    private var lastNotificationKey: String? = null
+
     override fun onCreate() {
         super.onCreate()
         ServiceStatus.resetSession()
         ServiceStatus.setRunning(true)
         createNotificationChannel()
-        startInForeground(buildNotification(waiting = true))
+        startInForeground(buildNotification())
+        lastNotificationKey = composeNotificationKey()
+        observeStatusForNotification()
         Diagnostics.log(TAG, "Foreground-Service erstellt")
     }
 
@@ -74,6 +85,7 @@ class GpsRemoteService : LifecycleService() {
         if (!gattServerManager!!.start()) {
             Diagnostics.log(TAG, "BLE-Start fehlgeschlagen (Permissions?)")
         }
+        GattServerManager.activeInstance = gattServerManager
 
         acquireWakeLock()
 
@@ -99,11 +111,14 @@ class GpsRemoteService : LifecycleService() {
     }
 
     override fun onDestroy() {
+        notificationJob?.cancel(); notificationJob = null
+        recTickerJob?.cancel(); recTickerJob = null
         locationJob?.cancel()
         locationController?.stop()
         locationController = null
         gattServerManager?.stop()
         gattServerManager = null
+        GattServerManager.activeInstance = null
         releaseWakeLock()
         ServiceStatus.setRunning(false)
         Diagnostics.log(TAG, "Foreground-Service beendet")
@@ -112,26 +127,141 @@ class GpsRemoteService : LifecycleService() {
 
     // ------------------------------------------------------------ Notification
 
-    private fun buildNotification(waiting: Boolean): Notification {
+    /**
+     * Beobachtet alle Status-Flows und aktualisiert die Foreground-Notification
+     * bei relevanten Aenderungen. Ein zusaetzlicher 1-Hz-Ticker laeuft WAEHREND
+     * einer Aufnahme, damit der Rec-Timer auch zwischen den ~1 Hz Display-
+     * Frames der Kamera weiterlaeuft.
+     */
+    private fun observeStatusForNotification() {
+        notificationJob?.cancel()
+        notificationJob = lifecycleScope.launch {
+            combine(
+                ServiceStatus.isRunning,
+                ServiceStatus.bleState,
+                ServiceStatus.lastFix,
+                ServiceStatus.cameraDisplay,
+                ServiceStatus.cameraStorage,
+            ) { _, _, _, _, _ ->
+                refreshNotificationIfChanged()
+                Unit
+            }.collect { }
+        }
+
+        recTickerJob?.cancel()
+        recTickerJob = lifecycleScope.launch {
+            while (true) {
+                kotlinx.coroutines.delay(1000)
+                if (ServiceStatus.cameraDisplay.value.isRecording) {
+                    refreshNotificationIfChanged()
+                }
+            }
+        }
+    }
+
+    /** Baut die Notification neu, falls sich ihr Inhalt geaendert hat. */
+    private fun refreshNotificationIfChanged() {
+        val key = composeNotificationKey()
+        if (key == lastNotificationKey) return
+        lastNotificationKey = key
+        try {
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            nm.notify(NOTIFICATION_ID, buildNotification())
+        } catch (e: Exception) {
+            Diagnostics.log(TAG, "Notification-Update fehlgeschlagen: ${e.message}")
+        }
+    }
+
+    /** GPS-Statuszeile aus dem letzten Fix (Qualitaet, Satelliten, Genauigkeit). */
+    private fun gpsStatusLine(): String {
+        val fix = ServiceStatus.lastFix.value
+        val ageMs = System.currentTimeMillis() - (fix?.utcEpochMillis ?: 0L)
+        return when {
+            fix == null || fix.fixQuality == dev.hansel.insta360remote.location.GpsFix.FixQuality.NO_FIX ->
+                getString(R.string.notif_gps_no_fix)
+            ageMs > STALE_FIX_MS ->
+                getString(R.string.notif_gps_stale, (ageMs / 1000L).toInt())
+            else -> getString(
+                R.string.notif_gps_fix,
+                fix.satelliteCount,
+                fix.horizontalAccuracyMeters.toInt().coerceAtLeast(0),
+            )
+        }
+    }
+
+    /** Kompakter Status-Schluessel fuer das Dedupe (Vergleich vor jedem Notify). */
+    private fun composeNotificationKey(): String {
+        val cam = ServiceStatus.cameraDisplay.value
+        val storage = ServiceStatus.cameraStorage.value
+        val ble = ServiceStatus.bleState.value
+        return listOf(
+            ble.javaClass.simpleName,
+            CameraStatusFormatter.formatRecTime(cam.recordingElapsedSeconds),
+            cam.modeString ?: "",
+            gpsStatusLine(),
+            storage?.freeMb ?: -1L,
+            ServiceStatus.notifyCount.value.toString(),
+        ).joinToString("|")
+    }
+
+    private fun buildNotification(): Notification {
         val openApp = PendingIntent.getActivity(
             this, 0,
             Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
-        val text = if (waiting) {
-            getString(R.string.notif_text_waiting)
-        } else {
-            val device = (ServiceStatus.bleState.value as? BleConnectionState.Connected)
-                ?.deviceName ?: "?"
-            getString(R.string.notif_text_connected, device, ServiceStatus.notifyCount.value)
+        val cam = ServiceStatus.cameraDisplay.value
+        val storage = ServiceStatus.cameraStorage.value
+        val battery = ServiceStatus.cameraBattery.value
+        val deviceName = (ServiceStatus.bleState.value as? BleConnectionState.Connected)
+            ?.deviceName ?: getString(R.string.notif_device_unknown)
+
+        val title = when {
+            cam.isRecording ->
+                getString(R.string.notif_rec_title, CameraStatusFormatter.formatRecTime(cam.recordingElapsedSeconds))
+            ServiceStatus.bleState.value is BleConnectionState.Connected ->
+                getString(R.string.notif_title_connected_short, deviceName)
+            else ->
+                getString(R.string.notif_title_waiting_short)
+        }
+
+        val text = listOf(gpsStatusLine(), "Sends ${ServiceStatus.notifyCount.value}")
+            .joinToString(" · ")
+
+        val detailLines = buildList {
+            add(getString(R.string.notif_detail_camera, deviceName))
+            if (cam.isRecording) {
+                add(getString(R.string.notif_detail_recording, CameraStatusFormatter.formatRecTime(cam.recordingElapsedSeconds)))
+            } else {
+                add(getString(R.string.notif_detail_idle))
+            }
+            cam.modeString?.let { add(getString(R.string.notif_detail_mode, it)) }
+            if (battery != null && battery.levelPercent >= 0) {
+                add(getString(R.string.notif_detail_cam_battery, battery.levelPercent))
+            } else if (cam.batteryRuntimeString != null) {
+                add(getString(R.string.notif_detail_cam_runtime, cam.batteryRuntimeString!!))
+            }
+            if (storage != null && storage.freeMb >= 0) {
+                val totalPart = if (storage.totalMb > 0)
+                    "/${CameraStatusFormatter.formatGb(storage.totalMb)}" else ""
+                add(getString(
+                    R.string.notif_detail_storage,
+                    CameraStatusFormatter.formatGb(storage.freeMb), totalPart, storage.fileCount
+                ))
+            }
+            add(getString(R.string.notif_detail_gps, gpsStatusLine()))
+            add(getString(R.string.notif_detail_sends, ServiceStatus.notifyCount.value))
         }
 
         // IMPORTANCE_LOW: kein Sound, keine Heads-up-Anzeige.
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_menu_mylocation)
-            .setContentTitle(getString(R.string.notif_title))
+            .setContentTitle(title)
             .setContentText(text)
+            .setStyle(NotificationCompat.BigTextStyle()
+                .setBigContentTitle(title)
+                .bigText(detailLines.joinToString("\n")))
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
@@ -187,6 +317,9 @@ class GpsRemoteService : LifecycleService() {
         private const val CHANNEL_ID = "gps_remote_service"
         private const val NOTIFICATION_ID = 1
         const val ACTION_STOP = "dev.hansel.insta360remote.action.STOP"
+
+        /** Ab diesem Fix-Alter zeigt die Notification "Fix alt" statt "Fix". */
+        private const val STALE_FIX_MS = 10_000L
 
         fun start(context: Context) {
             context.startForegroundService(Intent(context, GpsRemoteService::class.java))

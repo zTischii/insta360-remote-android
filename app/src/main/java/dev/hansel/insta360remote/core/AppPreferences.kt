@@ -67,6 +67,17 @@ class AppPreferences(context: Context) {
         get() = prefs.getBoolean(KEY_ENABLE_DIRECT_CONTROL, true)
         set(value) = prefs.edit().putBoolean(KEY_ENABLE_DIRECT_CONTROL, value).apply()
 
+    /**
+     * Experimentelle Status-Abfragen ueber die Central-Verbindung zur Kamera
+     * (Architektur B, be81/be82): Speicherstand + Akku alle 30 s pollen und
+     * in Notification/UI anzeigen. Benoetigt [enableDirectControl]; kann
+     * unabhaengig davon abgeschaltet werden, falls eine Kamera-Firmware
+     * darauf empfindlich reagiert.
+     */
+    var enableStatusQueries: Boolean
+        get() = prefs.getBoolean(KEY_ENABLE_STATUS_QUERIES, true)
+        set(value) = prefs.edit().putBoolean(KEY_ENABLE_STATUS_QUERIES, value).apply()
+
     companion object {
         private const val KEY_AUTO_START = "auto_start_on_boot"
         private const val KEY_USE_FUSED = "use_fused_location"
@@ -75,6 +86,7 @@ class AppPreferences(context: Context) {
         private const val KEY_IDLE_INTERVAL = "idle_interval_ms"
         private const val KEY_CAMERA_SERIAL = "camera_serial"
         private const val KEY_ENABLE_DIRECT_CONTROL = "enable_direct_control"
+        private const val KEY_ENABLE_STATUS_QUERIES = "enable_status_queries"
 
         @Volatile private var instance: AppPreferences? = null
 

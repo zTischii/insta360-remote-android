@@ -5,9 +5,12 @@
     <string name="status_service">Service: %s</string>
     <string name="status_ble">BLE: %s</string>
     <string name="status_last_fix">Letzter GPS-Fix:\n%s</string>
+    <string name="status_camera">Kamera:\n%1$s</string>
     <string name="status_battery">Akku: %s</string>
     <string name="btn_toggle_start">Service starten</string>
     <string name="btn_toggle_stop">Service stoppen</string>
+    <string name="btn_shutter">Auslöser</string>
+    <string name="btn_mode">Modus</string>
     <string name="btn_permissions">Berechtigungen erteilen</string>
     <string name="btn_background_location">Standort \u201eImmer erlauben\u201c</string>
     <string name="btn_battery_opt">Akku-Optimierung deaktivieren</string>
@@ -19,4 +22,22 @@
     <string name="notif_title">Insta360 GPS Remote läuft</string>
     <string name="notif_text_waiting">Warte auf Kamera-Verbindung…</string>
     <string name="notif_text_connected">Verbunden mit %1$s · %2$d GPS-Sends</string>
+
+    <!-- Erweiterte Live-Notification: Aufnahmezeit, GPS-Status, Kamera-Status -->
+    <string name="notif_device_unknown">Kamera</string>
+    <string name="notif_rec_title">● REC %1$s</string>
+    <string name="notif_title_connected_short">Insta360 Remote · %1$s</string>
+    <string name="notif_title_waiting_short">Insta360 Remote · warte auf Kamera…</string>
+    <string name="notif_gps_fix">GPS Fix · %1$d Sat · ±%2$d m</string>
+    <string name="notif_gps_no_fix">GPS: kein Fix</string>
+    <string name="notif_gps_stale">GPS: Fix alt (%1$ds)</string>
+    <string name="notif_detail_camera">Kamera: %1$s</string>
+    <string name="notif_detail_recording">Aufnahme läuft: %1$s</string>
+    <string name="notif_detail_idle">Keine Aufnahme aktiv</string>
+    <string name="notif_detail_mode">Modus: %1$s</string>
+    <string name="notif_detail_cam_battery">Kamera-Akku: %1$d%%</string>
+    <string name="notif_detail_cam_runtime">Kamera-Restlaufzeit: %1$s</string>
+    <string name="notif_detail_storage">Speicher: %1$s%2$s frei · %3$d Dateien</string>
+    <string name="notif_detail_gps">GPS: %1$s</string>
+    <string name="notif_detail_sends">GPS-Sends: %1$d</string>
 </resources>

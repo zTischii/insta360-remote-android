@@ -36,10 +36,12 @@ object CameraClient {
 
     private var gatt: BluetoothGatt? = null
     private var connectingAddress: String? = null
+    private var appContext: Context? = null
 
     @SuppressLint("MissingPermission")
     fun connect(context: Context, device: BluetoothDevice) {
         if (gatt != null || connectingAddress == device.address) return
+        appContext = context.applicationContext
         connectingAddress = device.address
         Diagnostics.log(TAG, "VERBINDE als Central zu ${device.address} (${device.name})...")
         try {
@@ -54,6 +56,7 @@ object CameraClient {
     }
 
     fun close() {
+        callback.teardownStatusQueries()
         try { gatt?.close() } catch (_: Exception) {}
         gatt = null
         connectingAddress = null
@@ -85,6 +88,8 @@ object CameraClient {
                 BluetoothProfile.STATE_DISCONNECTED -> {
                     Diagnostics.log(TAG, "Kamera-Verbindung getrennt (status=$status)")
                     stopKeepalive()
+                    stopStatusPoller()
+                    pendingQueries.clear()
                     try { g.close() } catch (_: Exception) {}
                     gatt = null
                     connectingAddress = null
@@ -105,12 +110,12 @@ object CameraClient {
             //   - OHNE unseren Stoss bleibt der Server bei MTU 23 und Android
             //     stutzt jedes Notify auf 20 Byte Muell (Testlog 18:05).
             //
-            // Frueher machten wir hier noch Discovery + CCCD + Reads +
-            // Sync-/Keepalive-Writes auf be81 - letztere lieferten stets
-            // ok=false (WiFi-Protokoll-Framing, auf BLE bedeutungslos) und
-            // erzeugen nur Rauschen. Alles entfernt.
+            // NEU: Wenn Status-Abfragen aktiviert sind, starten wir hier die
+            // Service-Discovery, um das be82-CCCD zu abonnieren und danach
+            // periodisch Speicher/Akku zu pollen (siehe startStatusPoller).
             // ------------------------------------------------------------
-            Diagnostics.log(TAG, "Arch-B = MTU-Bootstrap abgeschlossen - Link bleibt idle offen")
+            Diagnostics.log(TAG, "Arch-B = MTU-Bootstrap abgeschlossen - Link bleibt offen")
+            maybeBeginStatusQueries(g)
         }
 
         @SuppressLint("MissingPermission")
@@ -204,6 +209,10 @@ object CameraClient {
                     Diagnostics.log(TAG, "Sync-Write fehlgeschlagen: ${e.message}")
                 }
                 startKeepalive(g)
+
+                // Schritt 4: Periodische Status-Abfragen (Speicher/Akku) -
+                // Antworten kommen asynchron als Header16-Frames auf be82.
+                startStatusPoller()
             } else {
                 Diagnostics.log(TAG, "WARNUNG: be81 (write) nicht gefunden!")
             }
@@ -287,6 +296,206 @@ object CameraClient {
             } catch (_: Exception) {}
         }
 
+        // -------------------------------------------------- Status-Abfragen
+        // Speicher/Akku ueber Architektur B (be81/be82), Kommandos gemaess
+        // xaionaro-go/insta360ctl pkg/protocol/messagecode.go. Die offiziellen
+        // Enum-Namen weichen ab - die X-Serie belegt diese Codes empirisch so:
+        //   0x10 (offiziell SetFileExtra)      -> GetStorageInfo
+        //   0x12 (offiziell SetTimelapseOpts)  -> GetBatteryInfo
+        // Antworten: Header16 mit Command-Feld = 200 OK / 400 bad / 500 err,
+        // Sequence wird fuer die Zuordnung gespiegelt.
+        // (Hinweis: innerhalb eines anonymen Objects sind keine 'const val'
+        // erlaubt - daher einfache vals.)
+        private val CODE_GET_STORAGE_INFO = 0x10
+        private val CODE_GET_BATTERY_INFO = 0x12
+        private val CODE_RESPONSE_OK = 0x00C8
+        private val CODE_RESPONSE_BAD_REQUEST = 0x0190
+        private val CODE_RESPONSE_ERROR = 0x01F4
+        private val CODE_RESPONSE_NOT_IMPL = 0x01F5
+
+        private val STATUS_POLL_INTERVAL_MS = 30_000L
+
+        private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+
+        /** Ausstehende Queries: Seq -> Command-Code. */
+        private val pendingQueries = java.util.concurrent.ConcurrentHashMap<Int, Int>()
+
+        private var statusPollRunnable: Runnable? = null
+
+        private fun statusQueriesEnabled(): Boolean {
+            val ctx = appContext ?: return false
+            return try {
+                val prefs = dev.hansel.insta360remote.core.AppPreferences.get(ctx)
+                prefs.enableDirectControl && prefs.enableStatusQueries
+            } catch (_: Exception) {
+                false
+            }
+        }
+
+        @SuppressLint("MissingPermission")
+        private fun maybeBeginStatusQueries(g: BluetoothGatt) {
+            if (!statusQueriesEnabled()) {
+                Diagnostics.log(TAG, "Status-Abfragen deaktiviert (Prefs) - Link bleibt Bootstrap-only")
+                return
+            }
+            Diagnostics.log(TAG, "Starte Service-Discovery fuer Status-Abfragen (Speicher/Akku)")
+            try {
+                if (!g.discoverServices()) {
+                    Diagnostics.log(TAG, "discoverServices lieferte false")
+                }
+            } catch (e: Exception) {
+                Diagnostics.log(TAG, "discoverServices fehlgeschlagen: ${e.message}")
+            }
+        }
+
+        private fun startStatusPoller() {
+            if (!statusQueriesEnabled() || statusPollRunnable != null) return
+            Diagnostics.log(TAG, "Starte Status-Poller (${STATUS_POLL_INTERVAL_MS / 1000}s Intervall: Speicher + Akku)")
+            val r = object : Runnable {
+                override fun run() {
+                    if (pendingQueries.isNotEmpty()) {
+                        Diagnostics.log(TAG, "${pendingQueries.size} Status-Query/-Queries ohne Antwort verworfen")
+                        pendingQueries.clear()
+                    }
+                    val storageOk = sendQuery(CODE_GET_STORAGE_INFO)
+                    // Akku-Query zeitversetzt, damit sich BLE-Writes nicht ueberschneiden.
+                    mainHandler.postDelayed({ sendQuery(CODE_GET_BATTERY_INFO) }, 1500)
+                    if (!storageOk) {
+                        Diagnostics.log(TAG, "Storage-Query konnte nicht geschrieben werden (Link weg?)")
+                    }
+                    mainHandler.postDelayed(this, STATUS_POLL_INTERVAL_MS)
+                }
+            }
+            statusPollRunnable = r
+            mainHandler.postDelayed(r, 2000)
+        }
+
+        private fun stopStatusPoller() {
+            statusPollRunnable?.let { mainHandler.removeCallbacks(it) }
+            statusPollRunnable = null
+        }
+
+        /**
+         * Oeffentliche Teardown-Hilfe fuer die aeussere CameraClient-Klasse
+         * (close()): Private Member des anonymen Callback-Objects sind von
+         * aussen nicht sichtbar, daher der Umweg ueber diese oeffentliche Methode.
+         */
+        fun teardownStatusQueries() {
+            stopStatusPoller()
+            pendingQueries.clear()
+        }
+
+        @SuppressLint("MissingPermission")
+        private fun sendQuery(cmd: Int): Boolean {
+            val wc = writeCharacteristic ?: return false
+            val g = gatt ?: return false
+            return try {
+                val seq = nextSeq()
+                pendingQueries[seq.toInt()] = cmd
+                wc.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                wc.value = buildHeader16Message(cmd, seq, ByteArray(0))
+                val ok = g.writeCharacteristic(wc)
+                if (!ok) pendingQueries.remove(seq.toInt())
+                ok
+            } catch (e: Exception) {
+                Diagnostics.log(TAG, "Status-Write fehlgeschlagen: ${e.message}")
+                false
+            }
+        }
+
+        /**
+         * Wertet Notifications der Kamera auf be82 aus (Header16-Format).
+         * Aufrufer: beide onCharacteristicChanged-Varianten - Android ruft
+         * auf API 33+ NUR die neue mit value-Parameter auf!
+         */
+        private fun handleBe82Notification(value: ByteArray?) {
+            if (value == null || value.size < 16) return
+            val payloadLen = (value[0].toInt() and 0xFF) or ((value[1].toInt() and 0xFF) shl 8)
+            val cmdCode = (value[7].toInt() and 0xFF) or ((value[8].toInt() and 0xFF) shl 8)
+            val seq = value[10].toInt() and 0xFF
+            if ((value[13].toInt() and 0x80) == 0 && payloadLen > 20) {
+                // Fragmentiertes Grosspaket - fuer Status-Antworten irrelevant.
+                return
+            }
+            val end = minOf(16 + payloadLen, value.size)
+            val payload = value.copyOfRange(16, end)
+
+            when (cmdCode) {
+                CODE_RESPONSE_OK -> resolveQueryResponse(seq, payload)
+                CODE_RESPONSE_BAD_REQUEST -> {
+                    Diagnostics.log(TAG, "Kamera kennt das Status-Cmd nicht (400) - Werte bleiben '-'")
+                    pendingQueries.remove(seq)
+                }
+                CODE_RESPONSE_ERROR, CODE_RESPONSE_NOT_IMPL -> {
+                    Diagnostics.log(TAG, "Kamera lehnte Status-Cmd ab (Code=$cmdCode)")
+                    pendingQueries.remove(seq)
+                }
+                else -> {
+                    // Unsollicited Notification (z.B. 0x2003 BatteryUpdate,
+                    // 0x2010 CaptureState) - nur loggen, Format modellabhaengig.
+                    Diagnostics.log(TAG, String.format(
+                        java.util.Locale.US, "be82-Notify cmd=0x%04X seq=%d: %s",
+                        cmdCode, seq, Diagnostics.hex(payload)))
+                }
+            }
+        }
+
+        private fun resolveQueryResponse(seq: Int, payload: ByteArray) {
+            val cmd = pendingQueries.remove(seq)
+            if (cmd == null) {
+                Diagnostics.log(TAG, "Antwort ohne zugehoerige Query (seq=$seq): " + Diagnostics.hex(payload))
+                return
+            }
+            when (cmd) {
+                CODE_GET_STORAGE_INFO -> parseStoragePayload(payload)?.let {
+                    dev.hansel.insta360remote.core.ServiceStatus.setCameraStorage(it)
+                    Diagnostics.log(TAG,
+                        "SPEICHER: total=${it.totalMb}MB frei=${it.freeMb}MB dateien=${it.fileCount}")
+                } ?: Diagnostics.log(TAG, "Storage-Antwort unparsebar: " + Diagnostics.hex(payload))
+                CODE_GET_BATTERY_INFO -> parseBatteryPayload(payload)?.let {
+                    dev.hansel.insta360remote.core.ServiceStatus.setCameraBattery(it)
+                    Diagnostics.log(TAG,
+                        "AKKU: ${it.levelPercent}%${if (it.voltageMv > 0) " @ ${it.voltageMv}mV" else ""}")
+                } ?: Diagnostics.log(TAG, "Battery-Antwort unparsebar: " + Diagnostics.hex(payload))
+            }
+        }
+
+        /**
+         * Storage-Payload laut insta360ctl camera_status.go (X-Serie):
+         * [0..3] totalMB u32LE, [4..7] freeMB u32LE, [8..11] fileCount u32LE.
+         */
+        private fun parseStoragePayload(pb: ByteArray): dev.hansel.insta360remote.core.CameraStorageInfo? {
+            if (pb.size < 8) return null
+            fun u32(off: Int): Long {
+                var v = 0L
+                for (i in 3 downTo 0) v = (v shl 8) or ((pb[off + i].toLong() and 0xFF))
+                return v
+            }
+            return dev.hansel.insta360remote.core.CameraStorageInfo(
+                totalMb = u32(0),
+                freeMb = u32(4),
+                fileCount = if (pb.size >= 12) u32(8) else -1L,
+                queriedAtMillis = System.currentTimeMillis(),
+            )
+        }
+
+        /**
+         * Battery-Payload laut insta360ctl camera_status.go (X-Serie):
+         * [0] Level %, [1..2] Spannung mV u16LE.
+         */
+        private fun parseBatteryPayload(pb: ByteArray): dev.hansel.insta360remote.core.CameraBatteryInfo? {
+            if (pb.isEmpty()) return null
+            val level = pb[0].toInt() and 0xFF
+            val mv = if (pb.size >= 3) {
+                (pb[1].toInt() and 0xFF) or ((pb[2].toInt() and 0xFF) shl 8)
+            } else -1
+            return dev.hansel.insta360remote.core.CameraBatteryInfo(
+                levelPercent = level,
+                voltageMv = mv,
+                queriedAtMillis = System.currentTimeMillis(),
+            )
+        }
+
         // -------------------------------------------------- GPS-Injection
         // Header16-Cmd 0x35 (CodeUploadGPS) - auf GO 2/GO 3 verifiziert
         // (xaionaro-go/insta360ctl pkg/direct/gps.go), dort Payload = 3 x float64
@@ -308,19 +517,20 @@ object CameraClient {
          * Header16-Nachricht (X3/X4/X5-Architektur B):
          * [0..1] uint16 LE payload_length (ohne Header)
          * [4]    0x04 (Mode)
-         * [7]    Command code
+         * [7..8] Command code (uint16 LE)
          * [9]    0x02 (Content type protobuf)
          * [10]   Sequence number (1-254)
          * [13]   0x80 (is_last_fragment)
          */
-        private fun buildHeader16Message(cmd: Int, payload: ByteArray): ByteArray {
+        private fun buildHeader16Message(cmd: Int, seq: Byte, payload: ByteArray): ByteArray {
             val msg = ByteArray(16 + payload.size)
             msg[0] = (payload.size and 0xFF).toByte()
             msg[1] = ((payload.size shr 8) and 0xFF).toByte()
             msg[4] = 0x04
-            msg[7] = cmd.toByte()
+            msg[7] = (cmd and 0xFF).toByte()
+            msg[8] = ((cmd shr 8) and 0xFF).toByte()
             msg[9] = 0x02
-            msg[10] = nextSeq()
+            msg[10] = seq
             msg[13] = 0x80.toByte()
             payload.copyInto(msg, 16)
             return msg
@@ -359,7 +569,7 @@ object CameraClient {
             payload[20] = 0x19
             putDoubleLE(payload, 21, alt)
 
-            return buildHeader16Message(0x35, payload)
+            return buildHeader16Message(0x35, nextSeq(), payload)
         }
 
         /** Letzter Fix, der an die Kamera gestreamt werden soll. */
@@ -425,15 +635,22 @@ object CameraClient {
             )
         }
 
-        @Suppress("DEPRECATION")
+        @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
         override fun onCharacteristicChanged(
             g: BluetoothGatt,
             characteristic: BluetoothGattCharacteristic,
         ) {
-            Diagnostics.log(
-                TAG,
-                "NOTIFY von Kamera ${characteristic.uuid}: ${Diagnostics.hex(characteristic.value)}"
-            )
+            // Alte Signatur (API < 33): value muss aus der Characteristic gelesen werden.
+            handleBe82Notification(characteristic.value)
+        }
+
+        override fun onCharacteristicChanged(
+            g: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            value: ByteArray,
+        ) {
+            // Neue Signatur (API 33+): Android liefert den Wert direkt mit.
+            handleBe82Notification(value)
         }
     }
 }

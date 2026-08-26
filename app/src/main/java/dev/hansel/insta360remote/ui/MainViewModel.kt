@@ -23,7 +23,18 @@ data class MainUiState(
     val lastFixText: String = "-",
     val notifyCount: Long = 0,
     val batteryText: String = "-",
+    /** Mehrzeiliger Kamera-Status (REC/Modus/Akku/Speicher). */
+    val cameraStatusText: String = "-",
     val logLines: List<String> = emptyList(),
+)
+
+/** Intermediates Combine-Ergebnis (Kotlin combine unterstuetzt max. 5 Flows). */
+private data class UiCore(
+    val running: Boolean,
+    val bleState: BleConnectionState,
+    val fix: dev.hansel.insta360remote.location.GpsFix?,
+    val notifyCount: Long,
+    val cameraStatusText: String,
 )
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -34,25 +45,67 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _autoStartEnabled = MutableStateFlow(prefs.autoStartOnBoot)
     val autoStartEnabled: StateFlow<Boolean> = _autoStartEnabled.asStateFlow()
 
+    /** Kamera-Status (REC/Modus/Akku/Speicher) als mehrzeiliger Text. */
+    private val cameraInfoFlow = combine(
+        ServiceStatus.cameraDisplay,
+        ServiceStatus.cameraStorage,
+        ServiceStatus.cameraBattery,
+    ) { display, storage, battery ->
+        buildString {
+            if (display.isRecording) {
+                append("● REC ")
+                append(dev.hansel.insta360remote.core.CameraStatusFormatter.formatRecTime(display.recordingElapsedSeconds))
+            } else {
+                append("Keine Aufnahme")
+            }
+            display.modeString?.let { append("\nModus: ").append(it) }
+            when {
+                battery != null && battery.levelPercent >= 0 -> {
+                    append("\nKamera-Akku: ").append(battery.levelPercent).append('%')
+                    if (battery.voltageMv > 0) append(" (").append(battery.voltageMv).append(" mV)")
+                }
+                display.batteryRuntimeString != null ->
+                    append("\nKamera-Restlaufzeit: ").append(display.batteryRuntimeString)
+            }
+            if (storage != null && storage.freeMb >= 0) {
+                val total = if (storage.totalMb > 0)
+                    " von " + dev.hansel.insta360remote.core.CameraStatusFormatter.formatGb(storage.totalMb)
+                else ""
+                append("\nSpeicher: ")
+                    .append(dev.hansel.insta360remote.core.CameraStatusFormatter.formatGb(storage.freeMb))
+                    .append(total).append(" frei · ")
+                    .append(storage.fileCount).append(" Dateien")
+            } else {
+                append("\nSpeicher: -")
+            }
+        }
+    }
+
     val uiState: StateFlow<MainUiState> = combine(
-        ServiceStatus.isRunning,
-        ServiceStatus.bleState,
-        ServiceStatus.lastFix,
-        ServiceStatus.notifyCount,
+        combine(
+            ServiceStatus.isRunning,
+            ServiceStatus.bleState,
+            ServiceStatus.lastFix,
+            ServiceStatus.notifyCount,
+            cameraInfoFlow,
+        ) { running, ble, fix, notifies, camInfo ->
+            UiCore(running, ble, fix, notifies, camInfo)
+        },
         Diagnostics.lines,
-    ) { running, ble, fix, notifies, logs ->
+    ) { core, logs ->
         MainUiState(
-            serviceRunning = running,
-            bleState = ble,
-            lastFixText = fix?.let {
+            serviceRunning = core.running,
+            bleState = core.bleState,
+            lastFixText = core.fix?.let {
                 "lat=%.6f lon=%.6f alt=%.1fm speed=%.1fm/s sats=%d acc=%.0fm (%s)".format(
                     it.latitude, it.longitude, it.altitudeMeters, it.speedMps,
                     it.satelliteCount, it.horizontalAccuracyMeters, it.fixQuality
                 )
             } ?: "-",
-            notifyCount = notifies,
+            notifyCount = core.notifyCount,
             logLines = logs.takeLast(60),
             batteryText = readBatteryStatus(),
+            cameraStatusText = core.cameraStatusText,
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), MainUiState())
 
@@ -65,6 +118,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             GpsRemoteService.start(appContext)
         }
     }
+
+    /**
+     * Remote-Tasten (wirken wie die physischen Buttons des Original-GPS-
+     * Remotes): Kommandos gehen als ce82-Notify an die verbundene Kamera.
+     * false = kein Service/keine Kamera verbunden.
+     */
+    fun sendShutter(): Boolean =
+        dev.hansel.insta360remote.ble.GattServerManager.activeInstance?.sendShutter() ?: false
+
+    fun sendModeCycle(): Boolean =
+        dev.hansel.insta360remote.ble.GattServerManager.activeInstance?.sendModeCycle() ?: false
 
     fun setAutoStart(enabled: Boolean) {
         prefs.autoStartOnBoot = enabled

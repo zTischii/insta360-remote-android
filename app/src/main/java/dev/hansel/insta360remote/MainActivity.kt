@@ -91,6 +91,22 @@ class MainActivity : AppCompatActivity() {
         findViewById<Button>(R.id.btnOemSettings).setOnClickListener { openOemSettings() }
         findViewById<Button>(R.id.btnToggle).setOnClickListener { onToggleClicked() }
 
+        // Original-Remote-Tasten (ce82-Kommandos an die Kamera):
+        findViewById<Button>(R.id.btnShutter).setOnClickListener {
+            feedback(
+                viewModel.sendShutter(),
+                okMsg = "Auslöser gesendet",
+                failMsg = "Nicht verbunden - Service starten und Kamera verbinden"
+            )
+        }
+        findViewById<Button>(R.id.btnMode).setOnClickListener {
+            feedback(
+                viewModel.sendModeCycle(),
+                okMsg = "Modus-Befehl gesendet",
+                failMsg = "Nicht verbunden - Service starten und Kamera verbinden"
+            )
+        }
+
         observeUiState()
         showOemHint()
         maybeAutoStart()
@@ -139,6 +155,8 @@ class MainActivity : AppCompatActivity() {
                     )
                     findViewById<TextView>(R.id.statusLastFix).text =
                         getString(R.string.status_last_fix, state.lastFixText)
+                    findViewById<TextView>(R.id.statusCamera).text =
+                        getString(R.string.status_camera, state.cameraStatusText)
                     findViewById<TextView>(R.id.statusBattery).text =
                         getString(R.string.status_battery, state.batteryText)
                     findViewById<TextView>(R.id.logText).text =
@@ -155,6 +173,10 @@ class MainActivity : AppCompatActivity() {
         val hint = OemBatteryHelper.detectOem(this)
         findViewById<TextView>(R.id.oemHint).text =
             getString(R.string.oem_hint, "${hint.manufacturer}: ${hint.hint}")
+    }
+
+    private fun feedback(ok: Boolean, okMsg: String, failMsg: String) {
+        Toast.makeText(this, if (ok) okMsg else failMsg, Toast.LENGTH_SHORT).show()
     }
 
     /** Startet den Service - aber nur mit eingeschaltetem Bluetooth. */
